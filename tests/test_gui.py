@@ -586,3 +586,38 @@ def test_clicking_links_follows_page_links_and_opens_only_safe_web_links(win, mo
                                      QtCore.Qt.NoButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
     QtTest.QTest.mouseRelease(vp, QtCore.Qt.LeftButton, pos=QtCore.QPoint(p.x() + 30, p.y() + 30))
     assert opened == ["https://example.org/x"]
+
+
+# ---------- polish ----------
+def test_pages_render_sharp_on_high_dpi_screens(win, monkeypatch):
+    w = win
+    base = w.cv._pix[0].pixmap()
+    assert base.devicePixelRatio() == 1.0
+    monkeypatch.setattr(type(w.cv), "devicePixelRatioF", lambda self: 2.0)
+    w.cv.relayout()
+    sharp = w.cv._pix[0].pixmap()
+    assert sharp.devicePixelRatio() == 2.0 and sharp.width() == pytest.approx(2 * base.width(), abs=2)
+    assert w.cv._pix[0].boundingRect().width() == pytest.approx(base.width(), abs=1)         # the size on screen is unchanged
+    w.set_tool("Rectangle"); drag(w, 0, (100, 150), (200, 220))                             # and the mouse maps to the same place
+    assert tuple(w.doc.markups()[0].rect) == pytest.approx((99, 149, 201, 221), abs=3)
+
+
+def test_window_layout_is_restored_on_the_next_start(app, tmp_path):
+    from openrevu.gui import Prefs
+    prefs = Prefs(); assert prefs.mem == {}                                                  # in memory during tests
+    w = Main(prefs=prefs); w.resize(1111, 777); w.show(); w.left_dock.hide(); app.processEvents()
+    w.close()
+    assert prefs.get("geometry") is not None and prefs.get("state") is not None
+    w2 = Main(prefs=prefs); w2.show(); app.processEvents()
+    assert abs(w2.width() - 1111) <= 4 and abs(w2.height() - 777) <= 4
+    d = fitz.open(); d.new_page(); p = str(tmp_path / "a.pdf"); d.save(p)
+    w3 = Main(prefs=Prefs())                                                                 # a fresh profile gets the defaults
+    assert w3.width() == 1480
+
+
+def test_long_markup_text_is_readable_in_a_tooltip(win):
+    w = win
+    w.doc.add_rect(0, fitz.Rect(10, 10, 60, 60)); w.doc.markups()[0].set_comment("A very long comment " * 20); w._after_change()
+    item = w.mk_table.item(0, 5)
+    assert item.toolTip() == "A very long comment " * 20 and w.mk_table.textElideMode() == QtCore.Qt.ElideRight
+    assert w.mk_table.columnWidth(5) >= 200

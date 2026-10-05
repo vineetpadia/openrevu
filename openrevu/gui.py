@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import fitz
 from PyQt5 import QtCore, QtGui, QtWidgets as W
@@ -13,6 +14,7 @@ from .canvas import Canvas
 from .core import STATUSES, Document
 from .gui_ops import ERRORS, DocumentOps, parse_pages  # noqa: F401  (parse_pages re-exported)
 from .icons import tool_icon
+from . import recovery
 from .toolchest import ToolChest
 
 # tool groups shown as drop-down buttons (each remembers the last tool you used)
@@ -155,12 +157,12 @@ class StartPage(W.QWidget):
 
 
 class Main(DocumentOps, W.QMainWindow):
-    def __init__(self, path=None):
+    def __init__(self, path=None, prefs=None):
         super().__init__()
         self.setWindowTitle("OpenRevu")
         self.resize(1480, 920)
         self.setStyleSheet(STYLE)
-        self.prefs = Prefs()
+        self.prefs = prefs or Prefs()
         self.clipboard: dict | None = None
         self.chest = ToolChest()
         self.color = (1.0, 0.0, 0.0)
@@ -190,6 +192,10 @@ class Main(DocumentOps, W.QMainWindow):
             self.restoreState(s)
         self._sync_central()
         self.statusBar().showMessage("Open a PDF to begin (Ctrl+O)")
+        self._autosave_rev: dict = {}           # document id -> the revision that was last written
+        self.autosave_timer = QtCore.QTimer(self)
+        self.autosave_timer.timeout.connect(self.autosave_now)
+        self.autosave_timer.start(int(float(os.environ.get("OPENREVU_AUTOSAVE_SECONDS", "60")) * 1000))
         if path:
             self.open(path)
 
@@ -202,6 +208,72 @@ class Main(DocumentOps, W.QMainWindow):
     @property
     def doc(self) -> Document | None:
         return self.cv.doc if self.cv else None
+
+    def autosave_now(self) -> int:
+        """Write a snapshot of every document with unsaved changes. Returns how many were written."""
+        n = 0
+        for i in range(self.tabs.count()):
+            cv = self.tabs.widget(i)
+            if not isinstance(cv, Canvas):
+                continue
+            d = cv.doc
+            if not d.modified or self._autosave_rev.get(d.recovery_id) == d.revision:
+                continue
+            try:
+                recovery.write(d.recovery_id, d._snapshot(), d.path, self.tabs.tabText(i).lstrip("*"), bool(d._password))
+                self._autosave_rev[d.recovery_id] = d.revision
+                n += 1
+            except OSError as e:     # a full disk must not interrupt the user's work
+                self.statusBar().showMessage(f"Autosave failed: {e}")
+        return n
+
+    def offer_recovery(self) -> int:
+        """After a crash: offer to restore the documents that had unsaved changes. Returns how many were restored."""
+        found = recovery.entries()
+        if not found:
+            return 0
+        names = "\n".join(f"  {m['title']}  ({time.strftime('%Y-%m-%d %H:%M', time.localtime(m['time']))})" for m in found)
+        box = W.QMessageBox(self)
+        box.setWindowTitle("Recover unsaved work")
+        box.setIcon(W.QMessageBox.Question)
+        box.setText(f"OpenRevu closed unexpectedly last time. It saved {len(found)} document(s) with unsaved changes:\n{names}")
+        restore = box.addButton("Recover", W.QMessageBox.AcceptRole)
+        discard = box.addButton("Discard", W.QMessageBox.DestructiveRole)
+        box.addButton("Ask me later", W.QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is discard:
+            for m in found:
+                recovery.remove(m["id"])
+            return 0
+        if box.clickedButton() is not restore:
+            return 0
+        n = 0
+        for m in found:
+            pw = None
+            while True:
+                try:
+                    d = Document(m["file"], pw)
+                    break
+                except PermissionError:
+                    pw, ok = W.QInputDialog.getText(self, "Password", f"Password for {m['title']}:", W.QLineEdit.Password)
+                    if not ok:
+                        d = None
+                        break
+                except Exception as e:   # damaged snapshot
+                    W.QMessageBox.warning(self, "Recover", f"{m['title']} could not be recovered: {e}")
+                    recovery.remove(m["id"])
+                    d = None
+                    break
+            if d is None:
+                continue
+            d.path = None                  # saving asks for a file name: never overwrite the snapshot or the original silently
+            d.suggested_path = m.get("path")
+            d.modified = True
+            self._attach(d, f"{m['title']} (recovered)")
+            self.tabs.setTabText(self.tabs.currentIndex(), self._title())
+            recovery.remove(m["id"])
+            n += 1
+        return n
 
     def _need_doc(self) -> bool:
         if not self.cv:
@@ -438,6 +510,9 @@ class Main(DocumentOps, W.QMainWindow):
         self.mk_table.setHorizontalHeaderLabels(["Page", "Subject", "Type", "Author", "Status", "Comment", "Value"])
         self.mk_table.horizontalHeader().setStretchLastSection(True)
         self.mk_table.verticalHeader().hide()
+        self.mk_table.horizontalHeader().setSectionResizeMode(W.QHeaderView.Interactive)   # the user can widen a column
+        self.mk_table.setWordWrap(False)
+        self.mk_table.setTextElideMode(QtCore.Qt.ElideRight)
         self.mk_table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.mk_table.customContextMenuRequested.connect(self._table_menu)
         self.mk_table.itemSelectionChanged.connect(self._table_select)
@@ -806,6 +881,7 @@ class Main(DocumentOps, W.QMainWindow):
 
     def _attach(self, d: Document, title):
         cv = Canvas(d)
+        d.recovery_id = recovery.new_id()
         cv.status.connect(self.statusBar().showMessage)
         cv.changed.connect(self._after_change)
         cv.selection_changed.connect(self._load_props)
@@ -842,6 +918,8 @@ class Main(DocumentOps, W.QMainWindow):
                 return
             if r == W.QMessageBox.Save and not self._save(cv.doc):
                 return
+        recovery.remove(cv.doc.recovery_id)       # saved or discarded on purpose: no snapshot is needed
+        self._autosave_rev.pop(cv.doc.recovery_id, None)
         self.tabs.removeTab(i)
         cv.deleteLater()
         self._sync_central()
@@ -872,7 +950,7 @@ class Main(DocumentOps, W.QMainWindow):
             if d.path:
                 d.save()
             else:
-                p, _ = W.QFileDialog.getSaveFileName(self, "Save", "", "PDF (*.pdf)")
+                p, _ = W.QFileDialog.getSaveFileName(self, "Save", getattr(d, "suggested_path", None) or "", "PDF (*.pdf)")
                 if not p:
                     return False
                 d.save(p)
@@ -881,6 +959,8 @@ class Main(DocumentOps, W.QMainWindow):
         except ERRORS as e:
             W.QMessageBox.warning(self, "Save failed", str(e))
             return False
+        recovery.remove(d.recovery_id)
+        self._autosave_rev.pop(d.recovery_id, None)
         self.statusBar().showMessage("Saved")
         return True
 
@@ -897,6 +977,8 @@ class Main(DocumentOps, W.QMainWindow):
             if p:
                 self.cv.select(None)
                 if self._run(self.doc.save, p, msg=f"Saved {p}"):
+                    recovery.remove(self.doc.recovery_id)
+                    self._autosave_rev.pop(self.doc.recovery_id, None)
                     self.tabs.setTabText(self.tabs.currentIndex(), os.path.basename(p))
                     self.prefs.add_recent(p)
 
@@ -1037,7 +1119,13 @@ class Main(DocumentOps, W.QMainWindow):
 
     def _title(self):
         d = self.doc
-        return ("*" if d.modified else "") + (os.path.basename(d.path) if d and d.path else "Untitled")
+        if d and d.path:
+            name = os.path.basename(d.path)
+        elif d and getattr(d, "suggested_path", None):
+            name = os.path.basename(d.suggested_path) + " (recovered)"     # restored after a crash, not saved yet
+        else:
+            name = "Untitled"
+        return ("*" if d.modified else "") + name
 
     def refresh_all(self):
         self.refresh_markups()
@@ -1078,6 +1166,7 @@ class Main(DocumentOps, W.QMainWindow):
                 t.insertRow(i)
                 for c, txt in enumerate(row):
                     it = W.QTableWidgetItem(txt)
+                    it.setToolTip(txt)                 # the full text, when the column is too narrow
                     if c == 0:
                         it.setData(QtCore.Qt.UserRole, len(self._rows))
                         it.setData(QtCore.Qt.DisplayRole, int(txt))
@@ -1088,6 +1177,10 @@ class Main(DocumentOps, W.QMainWindow):
                 for c, v in enumerate((subj, str(n), d.fmt(kind, tot, unit).split(" ")[0], {"area": f"{unit}²", "volume": f"{unit}³"}.get(kind, unit))):
                     self.meas_table.setItem(k, c, W.QTableWidgetItem(v))
         t.setSortingEnabled(True)
+        if not getattr(self, "_mk_widths_set", False):
+            for col, width in enumerate((50, 140, 90, 90, 90, 260, 100)):
+                t.setColumnWidth(col, width)
+            self._mk_widths_set = True
         self._rebuild_custom_fields()
         if d:
             lines = [f"{k.title()}: {d.fmt(k, v, u)}" for (k, u), v in sorted(d.takeoff().items())]
@@ -1630,4 +1723,5 @@ def main(argv=None):
     for extra in argv[2:]:
         win.open(extra)
     win.show()
+    QtCore.QTimer.singleShot(300, win.offer_recovery)     # after the window is on screen
     return app.exec_()

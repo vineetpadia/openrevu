@@ -2,6 +2,7 @@ import os
 
 # Tests must never read or write the real user preferences (recent files, window layout).
 os.environ["OPENREVU_NO_SETTINGS"] = "1"
+os.environ["OPENREVU_AUTOSAVE_SECONDS"] = "100000"   # tests call autosave_now() themselves
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
@@ -39,3 +40,11 @@ def fail_on_unhandled_exceptions():
     yield
     sys.excepthook = old
     assert not errors, "unhandled exception in an event handler:\n" + errors[0]
+
+
+@pytest.fixture(autouse=True)
+def isolated_recovery_dir(tmp_path, monkeypatch):
+    """Snapshots go to a fresh folder for each test, never to the real recovery folder."""
+    d = tmp_path / "recovery"
+    monkeypatch.setenv("OPENREVU_RECOVERY_DIR", str(d))
+    return d

@@ -101,9 +101,12 @@ class Canvas(W.QGraphicsView):
                 self._render_page(i)
 
     def _render_page(self, i):
-        pix = self.doc.render(i, self.zoom)
+        dpr = max(1.0, self.devicePixelRatioF())          # on a high-DPI screen render more pixels, so the page is sharp
+        pix = self.doc.render(i, self.zoom * dpr)
         img = QtGui.QImage(pix.samples, pix.width, pix.height, pix.stride, QtGui.QImage.Format_RGB888)
-        item = self.scene().addPixmap(QtGui.QPixmap.fromImage(img.copy()))
+        qpix = QtGui.QPixmap.fromImage(img.copy())
+        qpix.setDevicePixelRatio(dpr)                     # the logical size stays the same, so all coordinates are unchanged
+        item = self.scene().addPixmap(qpix)
         item.setPos(self._rects[i].topLeft())
         item.setZValue(1)
         self._pix[i] = item
