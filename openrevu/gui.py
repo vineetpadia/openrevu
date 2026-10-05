@@ -57,8 +57,8 @@ class Main(W.QMainWindow):
         self._build_options_bar()
         self.mk_table.verticalHeader().hide()
         self.d_thumbs.raise_()
-        self.resizeDocks([self.d_thumbs, self.d_props], [210, 270], QtCore.Qt.Horizontal)
-        self.resizeDocks([self.d_markups], [200], QtCore.Qt.Vertical)
+        self.resizeDocks([self.d_thumbs, self.d_props], [230, 270], QtCore.Qt.Horizontal)
+        self.resizeDocks([self.d_markups], [260], QtCore.Qt.Vertical)
         self.statusBar().showMessage("Open a PDF to begin (Ctrl+O)")
         self.setAcceptDrops(True)
         if path:
@@ -103,7 +103,7 @@ class Main(W.QMainWindow):
         return d
 
     def _build_docks(self):
-        self.thumbs = W.QListWidget(viewMode=W.QListView.IconMode, iconSize=QtCore.QSize(110, 140),
+        self.thumbs = W.QListWidget(viewMode=W.QListView.IconMode, iconSize=QtCore.QSize(100, 100), gridSize=QtCore.QSize(105, 125),
                                     resizeMode=W.QListView.Adjust, movement=W.QListView.Static, wordWrap=True)
         self.thumbs.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.thumbs.itemClicked.connect(lambda it: self.cv and self.cv.goto_page(self.thumbs.row(it)))
@@ -145,10 +145,12 @@ class Main(W.QMainWindow):
         ml.addWidget(self.mk_table)
         self.totals = W.QLabel()
         self.totals.setWordWrap(True)
-        ml.addWidget(self.totals)
+        trow = W.QHBoxLayout()
+        trow.addWidget(self.totals, 1)
         b = W.QPushButton("Measurement summary…")
         b.clicked.connect(self.show_summary)
-        ml.addWidget(b)
+        trow.addWidget(b)
+        ml.addLayout(trow)
         self.d_markups = self._dock("Markups List", mw, QtCore.Qt.BottomDockWidgetArea)
 
         pw = W.QWidget()
@@ -301,6 +303,7 @@ class Main(W.QMainWindow):
             self.addToolBarBreak() if title == "Markup" else None
 
     def _build_options_bar(self):
+        self.addToolBarBreak()
         tb = self.addToolBar("Options")
         tb.setObjectName("Options")
         self.color_btn = W.QPushButton("Colour")
@@ -366,6 +369,7 @@ class Main(W.QMainWindow):
         cv.tool = next((n for n, a in self.tool_actions.items() if a.isChecked()), "Select")
         i = self.tabs.addTab(cv, title)
         self.tabs.setCurrentIndex(i)
+        self.statusBar().showMessage(f"{title}: {d.page_count} page(s) — pick a tool from the toolbar")
 
     def new_from_images(self):
         ps, _ = W.QFileDialog.getOpenFileNames(self, "Images", "", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)")
