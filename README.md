@@ -59,25 +59,57 @@ pytest
 
 The tests do not open a visible window.
 
+## Window layout
+
+The window follows the Revu workflow.
+
+| Part | What it does |
+|---|---|
+| **Start page** | Shows when no file is open. Use it to open a file or pick a recent file. |
+| **Toolbar** | Open, save, undo, redo, Select, Pan, tool groups, zoom, and page buttons. |
+| **Tool groups** | **Shapes**, **Text & Review**, **Stamp & Sign**, and **Measure**. Each button remembers the last tool that you used. Click the arrow to see all tools in the group. |
+| **Properties toolbar** | Line colour, fill colour, width, and opacity. It changes the selected markup. If no markup is selected, it sets the values for new markups. |
+| **Left panel** | Thumbnails, Bookmarks, Search, and Layers. |
+| **Right panel** | Properties, Tool Chest, and Measurements. |
+| **Markups List** | A table of all markups, below the page. |
+| **Status bar** | Shows the scale of the page, the page number, and the zoom. |
+
+Point to an icon to see its name and shortcut.
+
 ## Basic use
 
 1. Open a PDF.
-2. Pick a tool from the toolbar.
+2. Pick a tool in the toolbar or in the **Tool Chest** panel.
 3. Click or drag on the page.
-4. Pick the **Select** tool to change a markup. Click a markup to select it. Drag it to move it.
-5. Press **Ctrl+S** to save.
+4. The tool returns to **Select** after each markup. Click the pin icon (**Keep tool**) to stay in the tool.
+5. To change a markup, click it. Drag it to move it. Drag the square handle to resize it.
+6. Right-click a markup to copy it, delete it, set its status, or reply to it.
+7. Press **Ctrl+S** to save.
 
 Press **Ctrl+Z** to undo and **Ctrl+Y** to redo. OpenRevu keeps the last 30 steps.
 
+| Key | Tool | Key | Tool |
+|---|---|---|---|
+| V | Select | T | Text |
+| H | Pan | O | Callout |
+| R | Rectangle | N | Note |
+| E | Ellipse | I | Highlight |
+| L | Line | S | Stamp |
+| A | Arrow | M | Length |
+| Y | Polyline | K | Count |
+| C | Cloud | F | Room fill |
+| P | Pen | | |
+
 ### Measure a drawing
 
-1. Pick **Calibrate**. Drag across a dimension that you know.
+1. Pick **Calibrate** (the ruler icon in the **Measure** group). Drag across a dimension that you know.
 2. Enter the real length and the unit.
 3. Pick **Length**, **Area**, or another measure tool.
 4. For a polyline or a polygon, click each point. Double-click to finish.
 5. Open **Measurement summary** to see the totals.
 
-You can also set the scale as a ratio. Use the menu **Measure > Set scale by ratio**.
+You can also set the scale as a ratio. Use the menu **Measure > Set scale by ratio**, or the **Measurements** panel.
+The status bar always shows the scale of the current page.
 
 To measure a room, pick **Fill** and click inside the room. OpenRevu finds the walls.
 It removes columns and other solid objects from the area.
@@ -91,6 +123,7 @@ The walls must form a closed shape. If there is a gap, OpenRevu shows an error.
 
 ### View
 
+- Start page with recent files
 - Tabs for many documents
 - Continuous scroll, zoom, and fit to width
 - Page thumbnails and bookmarks
@@ -115,7 +148,8 @@ Other viewers ignore these keys.
 ### Edit
 
 - Select, move, resize, and delete a markup
-- Copy, paste, and duplicate
+- Copy, paste, and duplicate (shapes, lines, pens, and text boxes)
+- Right-click menu
 - Change color, fill, width, opacity, subject, and comment in the **Properties** panel
 - Undo and redo
 
@@ -248,6 +282,10 @@ OpenRevu has these limits:
 
 Run `pytest` before you send a change. Add a test for each fix or new function.
 To make the screenshots again, run `python docs/make_screenshots.py`.
+
+## Credits
+
+The icons come from [Lucide](https://lucide.dev) (ISC licence). The licence text is in `openrevu/icons_svg/LICENSE-lucide.txt`.
 
 ## Licence
 

@@ -23,3 +23,6 @@ openrevu-cli = "openrevu.cli:main"
 
 [tool.setuptools]
 packages = ["openrevu"]
+
+[tool.setuptools.package-data]
+openrevu = ["icons_svg/*.svg", "icons_svg/LICENSE*"]

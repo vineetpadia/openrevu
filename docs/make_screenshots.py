@@ -4,6 +4,7 @@ import sys
 import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["OPENREVU_NO_SETTINGS"] = "1"  # do not touch real preferences
 import fitz
 from PyQt5 import QtCore, QtWidgets
 
@@ -37,9 +38,16 @@ def main():
     pdf = os.path.join(tmp, "Sample project.pdf")
     sample_plan(pdf)
     app = QtWidgets.QApplication([])
-    w = Main(pdf)
+    app.setStyle("Fusion")
+    w = Main()
     w.resize(1500, 950)
     w.show()
+    w.prefs.add_recent(pdf)
+    w.start.refresh()
+    for _ in range(10):
+        app.processEvents()
+    w.grab().save(os.path.join(OUT, "start-page.png"))
+    w.open(pdf)
     app.processEvents()
     d = w.doc
     d.set_scale(Scale.from_ratio(0.25, 1, "ft"))
@@ -60,13 +68,14 @@ def main():
     w.cv.fit_width()
     w.cv.select([x for x in d.markups() if x.subject == "Cloud"][0])
     w._after_change(); w.refresh_all()
-    w.d_thumbs.raise_()
+    w.show_panel("Thumbnails")
+    w.show_panel("Properties")
     for _ in range(30):
         app.processEvents()
         QtCore.QThread.msleep(20)
     w.grab().save(os.path.join(OUT, "main-window.png"))
 
-    w.d_toc.raise_(); w.cv.select(None); w.cv.goto_page(1)
+    w.show_panel("Bookmarks"); w.show_panel("Tool Chest"); w.cv.select(None); w.cv.goto_page(1)
     for _ in range(10):
         app.processEvents()
     w.grab().save(os.path.join(OUT, "bookmarks-and-page2.png"))

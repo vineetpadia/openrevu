@@ -5,7 +5,7 @@ import fitz
 import pytest
 
 pytest.importorskip("PyQt5")
-from PyQt5 import QtCore, QtTest, QtWidgets
+from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 
 from openrevu.gui import Main, parse_pages
 
@@ -195,6 +195,7 @@ def test_fill_tool_measures_clicked_room(app, tmp_path):
     ms = [m for m in w.doc.markups() if m.measurement()]
     assert len(ms) == 1 and ms[0].subject == "Fill Area"
     assert ms[0].measurement()[1] * 10000 == pytest.approx(294 * 194, rel=0.03)
+    w.set_tool("Fill")
     click(w, 0, 500, 600)  # outside: error reported, nothing added
     assert len([m for m in w.doc.markups() if m.measurement()]) == 1
     assert "enclosed" in w.statusBar().currentMessage()
@@ -207,7 +208,178 @@ def test_viewport_tool_and_sheet_actions(win, monkeypatch):
     drag(w, 0, (200, 200), (400, 400))
     assert len(w.doc.viewports) == 1 and w.doc.viewports[0][2].unit == "m"
     monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: ("bogus", True)))
+    w.set_tool("Viewport")  # single-use tools return to Select after each placement
     drag(w, 0, (100, 500), (150, 550))
     assert len(w.doc.viewports) == 1 and "Invalid" in w.statusBar().currentMessage()
     w.auto_bookmarks()
     assert "No sheet numbers" in w.statusBar().currentMessage() or "created" in w.statusBar().currentMessage()
+
+
+# ---------- Revu-style workflow ----------
+def test_single_use_tools_return_to_select_and_keep_tool_option(win):
+    w = win
+    w.set_tool("Rectangle")
+    drag(w, 0, (100, 150), (200, 220))
+    assert w.cv.tool == "Select" and w.tool_actions["Select"].isChecked()
+    w.act_keep.setChecked(True)
+    w.set_tool("Ellipse")
+    drag(w, 0, (250, 150), (350, 220)); drag(w, 0, (250, 300), (350, 380))
+    assert w.cv.tool == "Ellipse" and len([m for m in w.doc.markups() if m.kind == "Circle"]) == 2
+    w.act_keep.setChecked(False)
+    w.set_tool("Count")
+    click(w, 0, 100, 400); click(w, 0, 150, 400)
+    assert w.cv.tool == "Count" and w.doc.takeoff()[("count", "ea")] == 2
+
+
+def test_toolbar_groups_remember_last_tool_and_show_options(win):
+    w = win
+    assert w.group_buttons["Shapes"].defaultAction() is w.tool_actions["Rectangle"]
+    w.set_tool("Cloud")
+    assert w.group_buttons["Shapes"].defaultAction() is w.tool_actions["Cloud"] and w.tool_actions["Cloud"].isChecked()
+    assert w.cv.viewport().cursor().shape() == QtCore.Qt.CrossCursor
+    w.set_tool("Pan"); assert w.cv.viewport().cursor().shape() == QtCore.Qt.OpenHandCursor
+    w.set_tool("Select"); assert w.cv.viewport().cursor().shape() == QtCore.Qt.ArrowCursor
+    assert not w.w_depth_visible() if hasattr(w, "w_depth_visible") else True
+    w.set_tool("Volume"); assert all(a.isVisible() for a in w.opt_widgets["Volume"])
+    assert not any(a.isVisible() for a in w.opt_widgets["Stamp"])
+    w.set_tool("Stamp"); assert all(a.isVisible() for a in w.opt_widgets["Stamp"])
+
+
+def test_properties_toolbar_edits_selection_or_defaults(win):
+    w = win
+    w._set_stroke((0.0, 0.0, 1.0))                 # nothing selected: sets the default for new markups
+    assert w.color == (0.0, 0.0, 1.0) and w.cv.color == (0.0, 0.0, 1.0)
+    w.set_tool("Rectangle"); drag(w, 0, (100, 150), (200, 220))
+    m = w.doc.markups()[0]
+    assert tuple(m.annot.colors["stroke"]) == (0.0, 0.0, 1.0)
+    w.cv.select(m)                                  # selected: edits that markup only
+    w._set_stroke((0.0, 1.0, 0.0)); w.w_width.setValue(5.0); w.w_opacity.setValue(0.5)
+    m2 = w.doc.markups()[0]
+    assert tuple(m2.annot.colors["stroke"]) == (0.0, 1.0, 0.0) and m2.annot.border["width"] == 5.0
+    assert w.color == (0.0, 0.0, 1.0)               # default unchanged
+    w.cv.select(None)
+    assert w.w_width.value() == w.cv.width          # toolbar shows the defaults again
+    w.set_tool("Rectangle"); w._set_fill((1.0, 1.0, 0.0)); drag(w, 0, (300, 150), (380, 220))
+    filled = [x for x in w.doc.markups() if x.annot.colors.get("fill")]
+    assert len(filled) == 1 and tuple(filled[0].annot.colors["fill"]) == (1.0, 1.0, 0.0)
+
+
+def test_context_menu_actions(win, monkeypatch):
+    w = win
+    w.set_tool("Rectangle"); drag(w, 0, (100, 150), (200, 220))
+    m = w.doc.markups()[0]; w.cv.select(m)
+    menu = w.build_context_menu(m)
+    labels = [a.text() for a in menu.actions() if not a.isSeparator()]
+    assert labels == ["Properties", "Copy", "Duplicate", "Delete", "Set status", "Reply…", "Add to Tool Chest…"]
+    status_menu = [a for a in menu.actions() if a.text() == "Set status"][0].menu()
+    [a for a in status_menu.actions() if a.text() == "Rejected"][0].trigger()
+    assert w.doc.markups()[0].status == "Rejected"
+    [a for a in menu.actions() if a.text() == "Duplicate"][0].trigger()
+    assert len(w.doc.markups()) == 2
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: ("looks good", True)))
+    [a for a in menu.actions() if a.text() == "Reply…"][0].trigger()
+    assert [t for _, t in w.cv.selected.replies()] == ["looks good"]
+    [a for a in menu.actions() if a.text() == "Delete"][0].trigger()
+    assert len(w.doc.markups()) == 1
+    empty = w.build_context_menu(None, 0, (50.0, 60.0))
+    paste = empty.actions()[0]
+    assert paste.text() == "Paste here" and paste.isEnabled()      # clipboard was filled by Duplicate
+    paste.trigger()
+    assert len(w.doc.markups()) == 2
+
+
+def test_tool_chest_panel_activates_tools_stamps_and_saved(win, monkeypatch, tmp_path):
+    w = win
+    w.chest.path = str(tmp_path / "tc.json"); w.chest.items = {}
+    top = {w.chest_tree.topLevelItem(i).text(0): w.chest_tree.topLevelItem(i) for i in range(w.chest_tree.topLevelItemCount())}
+    assert set(top) == {"Shapes", "Text & Review", "Stamp & Sign", "Measure", "Stamps", "My Tools"}
+    cloud = [top["Shapes"].child(i) for i in range(top["Shapes"].childCount()) if top["Shapes"].child(i).text(0) == "Cloud"][0]
+    w._chest_clicked(cloud); assert w.cv.tool == "Cloud"
+    rejected = [top["Stamps"].child(i) for i in range(top["Stamps"].childCount()) if top["Stamps"].child(i).text(0) == "REJECTED"][0]
+    w._chest_clicked(rejected); assert w.cv.tool == "Stamp" and w.cv.stamp_text == "REJECTED"
+    click(w, 0, 300, 300)
+    assert any(m.comment == "REJECTED" for m in w.doc.markups())
+    # a stamp cannot be saved as a tool: the user gets a message, not a failing tool
+    w.cv.select([m for m in w.doc.markups() if m.subject == "Stamp"][0])
+    w.chest_add()
+    assert "cannot be saved as a tool" in w.statusBar().currentMessage() and w.chest.items == {}
+    w.copy_markup()
+    assert "cannot be copied" in w.statusBar().currentMessage() and w.clipboard is None
+    # a shape can
+    w.set_tool("Rectangle"); drag(w, 0, (100, 150), (200, 220))
+    w.cv.select([m for m in w.doc.markups() if m.kind == "Square"][0])
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: ("My box", True)))
+    w.chest_add()
+    assert "My box" in w.chest.items
+    mine = w.chest_my
+    assert [mine.child(i).text(0) for i in range(mine.childCount())] == ["My box"]
+    w._chest_clicked(mine.child(0))
+    n = len(w.doc.markups()); click(w, 0, 150, 500)
+    assert len(w.doc.markups()) == n + 1
+
+
+def test_start_page_recent_files_and_panels(app, tmp_path):
+    d = fitz.open(); d.new_page(); p = str(tmp_path / "r.pdf"); d.save(p)
+    w = Main(); w.show(); app.processEvents()
+    assert w.stack.currentWidget() is w.start and w.left_dock.isHidden() and w.d_markups.isHidden()
+    assert w.start.recent.item(0).text() == "No recent files"
+    w.open(p); app.processEvents()
+    assert w.stack.currentWidget() is w.tabs and not w.left_dock.isHidden() and not w.d_markups.isHidden()
+    assert w.prefs.recent() == [p]
+    w.close_tab(0); app.processEvents()
+    assert w.stack.currentWidget() is w.start and w.left_dock.isHidden()
+    assert "r.pdf" in w.start.recent.item(0).text()
+    opened = []
+    w.start.file_requested.connect(opened.append)
+    w.start.recent.itemActivated.emit(w.start.recent.item(0))
+    assert opened == [p]
+
+
+def test_status_bar_zoom_box_layers_and_measurements_panel(win, tmp_path):
+    w = win
+    app = QtWidgets.QApplication.instance()
+    w.cv.set_zoom(96 / 72 * 2)                      # 200%
+    assert w.lbl_zoom.text() == "200%" and w.zoom_box.currentText() == "200%"
+    assert w.lbl_page.text() == "Page 1 of 3" and w.lbl_scale.text().startswith("Scale: 1 in = ")
+    w.zoom_box.setCurrentText("50%"); w._zoom_from_box()
+    assert w.cv.zoom == pytest.approx(0.5 * 96 / 72)
+    w.zoom_box.setCurrentText("junk"); w._zoom_from_box()
+    assert w.zoom_box.currentText() == "50%"
+    w.cv.fit_page()
+    assert w.cv.zoom < 96 / 72 * 2
+    w.cv.goto_page(2); assert w.lbl_page.text() == "Page 3 of 3" and w.page_spin.value() == 3
+    # measurements panel
+    w.doc.add_count(0, (5, 5), group="Door"); w.doc.add_count(0, (9, 9), group="Door"); w._after_change()
+    rows = [[w.meas_table.item(r, c).text() for c in range(4)] for r in range(w.meas_table.rowCount())]
+    assert rows == [["Door", "2", "2", "ea"]]
+    assert "Page 3" in w.scale_lbl.text() and "Viewports on this page: 0" in w.scale_lbl.text()
+    w.show_panel("Measurements"); assert w.panel_name(w.right_tabs, w.right_tabs.currentIndex()) == "Measurements"
+    w.show_panel("Search"); assert w.panel_name(w.left_tabs, w.left_tabs.currentIndex()) == "Search"
+
+
+def test_layers_panel_toggles_layers(app, tmp_path):
+    d = fitz.open(); p = d.new_page(); d.add_ocg("Dims", on=True); d.add_ocg("Notes", on=False)
+    path = str(tmp_path / "l.pdf"); d.save(path)
+    w = Main(path); w.show(); app.processEvents()
+    items = [w.layer_list.item(i) for i in range(w.layer_list.count())]
+    assert [(i.text(), i.checkState() == QtCore.Qt.Checked) for i in items] == [("Dims", True), ("Notes", False)]
+    items[1].setCheckState(QtCore.Qt.Checked)
+    assert [l["on"] for l in w.doc.layers()] == [True, True]
+    plain = fitz.open(); plain.new_page(); pp = str(tmp_path / "p.pdf"); plain.save(pp)
+    w.open(pp)
+    assert w.layer_list.item(0).text() == "This PDF has no layers."
+
+
+def test_pan_tool_drags_the_view(win):
+    w = win
+    w.set_tool("Pan")
+    w.cv.set_zoom(3.0); w.cv.verticalScrollBar().setValue(0)
+    vp = w.cv.viewport()
+    QtTest.QTest.mousePress(vp, QtCore.Qt.LeftButton, pos=QtCore.QPoint(300, 400))
+    # a real drag holds the button down; QTest.mouseMove would send a move without it, which Qt ignores
+    QtWidgets.QApplication.sendEvent(vp, QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(300, 300),
+                                     QtCore.Qt.NoButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+    QtTest.QTest.mouseRelease(vp, QtCore.Qt.LeftButton, pos=QtCore.QPoint(300, 300))
+    assert w.cv.verticalScrollBar().value() == 100
+    assert w.doc.markups() == []
+    assert w.cv.viewport().cursor().shape() == QtCore.Qt.OpenHandCursor
