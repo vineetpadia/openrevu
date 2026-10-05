@@ -42,7 +42,7 @@ OCR needs the `tesseract` binary on PATH (tested with 5.5); room fill needs `num
 - Measurements that depend on extra geometry (angle, count, areas with cut-outs) can't be resized; delete and re-measure.
 - Undo history is kept in memory (encrypted for password-protected documents); closing the tab discards it.
 - Cryptographic signatures are validated against trust roots you supply (no OS trust store, no revocation checks).
-- Developed and tested on Linux only; Windows/macOS should work (Qt + PyMuPDF are cross-platform) but are unverified.
+- The automated suite (core + headless GUI) passes in CI on Linux, macOS and Windows; nobody has yet used the GUI interactively on macOS or Windows.
 - No human-factors testing yet — expect rough edges in the GUI.
 
 ## Licence
