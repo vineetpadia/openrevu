@@ -182,7 +182,16 @@ class PageOps:
 
     @staticmethod
     def ocr_available() -> bool:
-        return shutil.which("tesseract") is not None
+        """True if the tesseract binary is on PATH; also locates its language data when TESSDATA_PREFIX is unset."""
+        exe = shutil.which("tesseract")
+        if exe and not os.environ.get("TESSDATA_PREFIX"):
+            root = os.path.dirname(os.path.dirname(os.path.realpath(exe)))
+            for cand in (os.path.join(root, "share", "tessdata"), "/usr/share/tesseract-ocr/5/tessdata",
+                         "/usr/share/tesseract-ocr/4.00/tessdata", "/usr/share/tessdata"):
+                if os.path.isdir(cand):
+                    os.environ["TESSDATA_PREFIX"] = cand
+                    break
+        return exe is not None
 
     @mutates
     def ocr(self, language="eng", dpi=300, pages=None):
@@ -347,6 +356,29 @@ class PageOps:
         if not hit:
             raise KeyError(name)
         return hit
+
+    @mutates
+    def add_form_field(self, pno, rect, name, kind="text", value="", choices=()):
+        """Create a fillable field: kind is text | checkbox | combo | list | button (rect in visual coords)."""
+        types = {"text": fitz.PDF_WIDGET_TYPE_TEXT, "checkbox": fitz.PDF_WIDGET_TYPE_CHECKBOX,
+                 "combo": fitz.PDF_WIDGET_TYPE_COMBOBOX, "list": fitz.PDF_WIDGET_TYPE_LISTBOX,
+                 "button": fitz.PDF_WIDGET_TYPE_BUTTON}
+        if kind not in types:
+            raise ValueError(f"unknown field kind {kind!r}")
+        if not name or any(f["name"] == name for f in self.form_fields()):
+            raise ValueError(f"field name {name!r} is empty or already used")
+        if kind in ("combo", "list") and not choices:
+            raise ValueError("combo/list fields need choices")
+        w = fitz.Widget()
+        w.field_name, w.field_type = name, types[kind]
+        w.rect = self._ru(pno, rect)
+        w.field_value = value
+        if choices:
+            w.choice_values = list(choices)
+        if kind == "button":
+            w.field_label = value or name
+        w.border_color, w.fill_color = (0, 0, 0), (0.95, 0.95, 1)
+        self._page(pno).add_widget(w)
 
     # ---- layers ----
     def layers(self):

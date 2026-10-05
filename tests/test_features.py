@@ -63,10 +63,6 @@ def test_move_resize_all_geometry_types(pdf):  # noqa: C901
     d.add_highlight(0, fitz.Rect(60, 85, 200, 105))
     for m in d.markups():
         before = fitz.Rect(m.rect)
-        if m.kind == "Highlight":
-            with pytest.raises(ValueError):
-                m.move(10, 20)
-            continue
         m.move(10, 20)
         after = d.markups()[[x.xref for x in d.markups()].index(m.xref)].rect
         assert after.x0 == pytest.approx(before.x0 + 10, abs=1.5) and after.y0 == pytest.approx(before.y0 + 20, abs=1.5), m.kind
@@ -180,8 +176,6 @@ def test_measurement_label_moves_and_deletes_with_parent(pdf):
     m.move(10, 10)
     lab_after = [x for x in d.markups(include_children=True) if x.subject == "Label"][0].rect
     assert lab_after.x0 == pytest.approx(lab_before.x0 + 10, abs=1)
-    with pytest.raises(ValueError):
-        d.markups()[0].resize(fitz.Rect(0, 0, 5, 5))
     d.delete(d.markups()[0])
     assert d.markups(include_children=True) == []
 
@@ -654,3 +648,247 @@ def test_watermark_image_orientation(pdf, tmp_path, rot):
     assert dark, "image not drawn"
     cx = (min(dark) + max(dark)) / 2
     assert cx < w / 2 - 5, f"black half should be left of centre, got {cx} of {w}"
+
+
+# ---------- closing the "known gaps" ----------
+def test_text_markup_moves_but_does_not_resize(pdf):
+    d = Document(pdf)
+    d.add_highlight(0, fitz.Rect(70, 85, 250, 105)); d.add_underline(0, fitz.Rect(70, 85, 250, 105))
+    for m in d.markups():
+        r0 = fitz.Rect(m.rect)
+        m.move(15, 25)
+        r1 = [x for x in d.markups() if x.xref == m.xref][0].rect
+        assert (r1.x0 - r0.x0, r1.y0 - r0.y0) == pytest.approx((15, 25), abs=0.5), m.kind
+        with pytest.raises(ValueError, match="move"):
+            m.resize(fitz.Rect(0, 0, 10, 10))
+
+
+def test_resizing_measurements_remeasures(pdf):
+    d = Document(pdf)
+    d.set_scale(Scale("m", 0.1))
+    d.add_length(0, [(100, 100), (200, 100)])
+    d.add_perimeter(0, [(100, 200), (200, 200), (200, 300), (100, 300)])
+    d.add_area(0, [(300, 200), (400, 200), (400, 300), (300, 300)], depth=2.0)
+    d.add_ellipse_area(0, fitz.Rect(300, 400, 400, 500))
+    d.add_diameter(0, (100, 400), (200, 400))
+    before = {m.measurement()[0]: m.measurement()[1] for m in d.markups()}
+    assert before["length"] == pytest.approx(10) and before["volume"] == pytest.approx(200)
+    for m in list(d.markups()):
+        r = m.rect
+        m.resize(fitz.Rect(r.x0, r.y0, r.x0 + (r.width - 2) * 2 + 2, r.y0 + (r.height - 2) * 2 + 2))
+    after = {m.measurement()[0]: m.measurement()[1] for m in d.markups()}
+    assert after["length"] == pytest.approx(20, rel=0.02)
+    assert after["perimeter"] == pytest.approx(80, rel=0.03)
+    assert after["volume"] == pytest.approx(200 * 4, rel=0.06)
+    assert after["diameter"] == pytest.approx(20, rel=0.06)
+    assert after["area"] == pytest.approx(before["area"] * 4, rel=0.08)
+    assert len(d.markups()) == 5 and len(d.markups(include_children=True)) == 10  # labels re-created, no leaks
+    labels = {x.comment for x in d.markups(include_children=True) if x.subject == "Label"}
+    assert any(l.startswith("20.0") or "20.0" in l or "20.00" in l for l in labels)
+    for kind in ("count",):
+        d.add_count(0, (5, 5))
+        c = [m for m in d.markups() if m.measurement() and m.measurement()[0] == kind][0]
+        with pytest.raises(ValueError):
+            c.resize(fitz.Rect(0, 0, 30, 30))
+    d.add_angle(0, (10, 0), (0, 0), (0, 10))
+    with pytest.raises(ValueError):
+        [m for m in d.markups() if m.measurement()[0] == "angle"][0].resize(fitz.Rect(0, 0, 30, 30))
+    d.add_area(0, [(0, 0), (100, 0), (100, 100), (0, 100)], cutouts=[[(10, 10), (30, 10), (30, 30), (10, 30)]])
+    with pytest.raises(ValueError, match="cannot be resized"):
+        [m for m in d.markups() if m.subject == "Area"][-1].resize(fitz.Rect(0, 0, 300, 300))
+
+
+def room_pdf(path, rotation=0):
+    d = fitz.open(); p = d.new_page(width=600, height=800)
+    p.draw_rect(fitz.Rect(100, 100, 400, 300), width=3)           # outer walls: inner 294 x 194 pt
+    p.draw_rect(fitz.Rect(200, 150, 240, 190), width=2, fill=(0.5, 0.5, 0.5))  # column
+    p.draw_line((100, 500), (300, 500), width=3)                  # stray wall: not enclosed
+    p.set_rotation(rotation)
+    d.save(path); return str(path)
+
+
+@pytest.mark.parametrize("rot", [0, 90])
+def test_fill_area_measures_room_minus_columns(tmp_path, rot):
+    pytest.importorskip("scipy")
+    d = Document(room_pdf(tmp_path / "room.pdf", rot))
+    d.set_scale(Scale("m", 0.01))  # 1 pt = 1 cm
+    pt = (150, 250) if rot == 0 else d._tv(0, (150, 250))
+    _, v = d.add_fill_area(0, pt)
+    inner = 294 * 194 - 41 * 41   # room interior minus the column incl. its stroke
+    assert v * 10000 == pytest.approx(inner, rel=0.04)
+    m = [x for x in d.markups() if x.subject == "Fill Area"][0]
+    assert m.measurement()[0] == "area"
+    assert d.takeoff()[("area", "m")] == pytest.approx(v)
+    outer, holes = d.region_polygon(0, pt)
+    assert len(holes) == 1 and len(outer) >= 4
+
+
+def test_fill_area_errors(tmp_path):
+    pytest.importorskip("scipy")
+    d = Document(room_pdf(tmp_path / "room.pdf"))
+    with pytest.raises(ValueError, match="not enclosed"):
+        d.add_fill_area(0, (400, 650))        # open space outside any room
+    with pytest.raises(ValueError, match="open"):
+        d.add_fill_area(0, (100, 200))        # exactly on a wall line
+
+
+def test_undo_history_of_protected_documents_is_encrypted(pdf, tmp_path):
+    enc = str(tmp_path / "enc.pdf")
+    Document(pdf).save_encrypted(enc, "pw")
+    d = Document(enc, "pw")
+    d.add_rect(0, fitz.Rect(10, 10, 50, 50))
+    assert d._undo and all(fitz.open("pdf", b).needs_pass for b in d._undo)
+    assert d.undo() and d.markups() == [] and d.redo() and len(d.markups()) == 1
+    assert all(fitz.open("pdf", b).needs_pass for b in d._undo + d._redo)
+    plain = Document(pdf); plain.add_rect(0, fitz.Rect(1, 1, 5, 5))
+    assert not fitz.open("pdf", plain._undo[0]).needs_pass
+
+
+def test_ocr_makes_scans_searchable(tmp_path):
+    from openrevu.core import Document as D
+    if not D.ocr_available():
+        pytest.skip("tesseract not installed")
+    src = fitz.open(); p = src.new_page(); p.insert_text((72, 150), "INVOICE TOTAL 4500", fontsize=36)
+    scan = fitz.open(); sp = scan.new_page(width=p.rect.width, height=p.rect.height)
+    sp.insert_image(sp.rect, pixmap=p.get_pixmap(dpi=200)); path = str(tmp_path / "scan.pdf"); scan.save(path)
+    d = Document(path)
+    assert d.page_text(0).strip() == "" and d.search("INVOICE") == []
+    assert d.ocr() == 1
+    assert "INVOICE" in d.page_text(0) and d.search("4500")
+    assert d.ocr() == 0  # already has text: skipped
+
+
+def _selfsigned(tmp_path, cn="Test Signer"):
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs12
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(7).not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=30)).sign(key, hashes.SHA256()))
+    p12 = tmp_path / f"{cn}.p12"
+    p12.write_bytes(pkcs12.serialize_key_and_certificates(b"id", key, cert, None, serialization.BestAvailableEncryption(b"pw")))
+    pem = tmp_path / f"{cn}.pem"
+    pem.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    return str(p12), str(pem)
+
+
+def test_signature_trust_validation(pdf, tmp_path):
+    from openrevu.sign import sign_pdf, verify_signatures
+    p12, pem = _selfsigned(tmp_path)
+    _, other_pem = _selfsigned(tmp_path, "Someone Else")
+    out = str(tmp_path / "s.pdf"); sign_pdf(pdf, out, p12, "pw")
+    untrusted = verify_signatures(out)[0]
+    assert untrusted["intact"] and untrusted["valid"] and not untrusted["trusted"] and untrusted["whole_file"]
+    assert verify_signatures(out, [pem])[0]["trusted"]
+    assert not verify_signatures(out, [other_pem])[0]["trusted"]
+    with open(out, "ab") as f:
+        f.write(b"\n% tamper")
+    assert not verify_signatures(out, [pem])[0]["whole_file"]
+
+
+def test_create_and_fill_form_fields(pdf, tmp_path):
+    d = Document(pdf)
+    d.add_form_field(0, fitz.Rect(50, 50, 200, 70), "name", "text", "Bob")
+    d.add_form_field(0, fitz.Rect(50, 90, 70, 110), "agree", "checkbox")
+    d.add_form_field(0, fitz.Rect(50, 130, 200, 150), "colour", "combo", "red", choices=["red", "green"])
+    d.add_form_field(1, fitz.Rect(50, 50, 120, 80), "go", "button", "Submit")
+    f = {x["name"]: x for x in d.form_fields()}
+    assert set(f) == {"name", "agree", "colour", "go"} and f["name"]["value"] == "Bob" and f["colour"]["page"] == 0
+    d.set_form_value("name", "Alice")
+    out = str(tmp_path / "form.pdf"); d.save(out)
+    assert {x["name"]: x["value"] for x in Document(out).form_fields()}["name"] == "Alice"
+    for bad in (("name", "text"), ("", "text"), ("x", "bogus"), ("y", "combo")):
+        with pytest.raises(ValueError):
+            d.add_form_field(0, fitz.Rect(1, 1, 50, 20), *bad)
+    assert len(d._undo) == 5  # four successful adds + the value change; failed attempts left no undo steps
+    d.undo()  # undoes set_form_value
+    assert {x["name"]: x["value"] for x in d.form_fields()}["name"] == "Bob"
+
+
+def test_failed_operations_do_not_pollute_undo(pdf):
+    d = Document(pdf)
+    n = len(d._undo)
+    for fn in (lambda: d.delete_pages([9]), lambda: d.rotate_pages([0], 45), lambda: d.reorder([0, 0, 1]),
+               lambda: d.add_area(0, [(0, 0), (1, 0), (1, 1)], depth=-1)):
+        with pytest.raises((ValueError, IndexError)):
+            fn()
+    assert len(d._undo) == n
+
+
+# ---------- second-review regressions ----------
+def test_signature_verdict_catches_edits_after_signing(pdf, tmp_path):
+    from openrevu.sign import sign_pdf, verify_signatures
+    p12, pem = _selfsigned(tmp_path)
+    out = str(tmp_path / "s.pdf"); sign_pdf(pdf, out, p12, "pw")
+    assert verify_signatures(out, [pem])[0]["verdict_ok"]
+    assert not verify_signatures(out)[0]["verdict_ok"]            # untrusted
+    ed = fitz.open(out); ed[0].insert_text((50, 300), "FORGED TEXT"); ed.saveIncr(); ed.close()
+    r = verify_signatures(out, [pem])[0]
+    assert r["intact"] and r["trusted"]                            # the old flags alone would have said "fine"
+    assert not r["whole_file"] and not r["verdict_ok"]
+
+
+def test_fill_without_scipy_is_a_clean_error(tmp_path, monkeypatch):
+    import sys
+    d = Document(room_pdf(tmp_path / "r.pdf"))
+    monkeypatch.setitem(sys.modules, "scipy", None)
+    monkeypatch.setitem(sys.modules, "scipy.ndimage", None)
+    with pytest.raises(RuntimeError, match="scipy"):
+        d.add_fill_area(0, (150, 250))
+
+
+def test_fill_is_fast_with_many_small_obstacles():
+    np = pytest.importorskip("numpy"); pytest.importorskip("scipy")
+    import time
+    from openrevu.fill import find_region
+    free = np.ones((1500, 1500), bool)
+    free[[0, -1], :] = False; free[:, [0, -1]] = False
+    free[1:5, 1:] = False  # make sure the wall is closed with margin
+    for y in range(20, 1480, 12):
+        for x in range(20, 1480, 12):
+            free[y:y + 3, x:x + 3] = False  # ~15k islands
+    t = time.time()
+    outer, holes = find_region(free, (10, 700), min_hole=4)
+    assert time.time() - t < 5 and len(holes) > 10000
+
+
+def test_resize_does_not_add_label_that_was_not_there(pdf):
+    d = Document(pdf)
+    d.add_perimeter(0, [(100, 100), (200, 100), (200, 200)], label=False)
+    m = d.markups()[0]; r = m.rect
+    m.resize(fitz.Rect(r.x0, r.y0, r.x1 + 50, r.y1 + 50))
+    assert len(d.markups(include_children=True)) == 1
+
+
+def test_failed_operation_restores_dirty_and_redo_state(pdf):
+    d = Document(pdf)
+    d.add_rect(0, fitz.Rect(1, 1, 9, 9)); d.undo()
+    d.modified = False
+    snapshot = (len(d._undo), len(d._redo))
+    with pytest.raises(ValueError):
+        d.add_form_field(0, fitz.Rect(1, 1, 50, 20), "", "text")
+    assert not d.modified and (len(d._undo), len(d._redo)) == snapshot and d.redo()
+    d2 = Document(pdf)
+    for i in range(Document.MAX_UNDO):
+        d2.add_rect(0, fitz.Rect(1, 1, 5 + i, 5))
+    full = list(d2._undo)
+    with pytest.raises(IndexError):
+        d2.delete_pages([99])
+    assert d2._undo == full  # a failure at the undo cap must not evict the oldest step
+
+
+def test_fill_area_accuracy_within_half_percent(tmp_path):
+    pytest.importorskip("scipy")
+    d = fitz.open(); p = d.new_page(width=600, height=800)
+    p.draw_rect(fitz.Rect(100, 100, 200, 200), width=1)   # 99 x 99 interior
+    p.draw_rect(fitz.Rect(130, 130, 150, 150), width=1, fill=(0, 0, 0))   # 21 x 21 column incl. stroke
+    path = str(tmp_path / "acc.pdf"); d.save(path)
+    doc = Document(path)
+    doc.set_scale(Scale("m", 1.0))
+    _, v = doc.add_fill_area(0, (110, 110))
+    assert v == pytest.approx(99 * 99 - 21 * 21, rel=0.005)

@@ -15,7 +15,7 @@ from .toolchest import ToolChest
 
 MARKUP_TOOLS = ["Select", "Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Cloud", "Pen", "Highlight",
                 "Underline", "Strikeout", "Squiggly", "Text", "Callout", "Note", "Stamp", "Signature", "Redact"]
-MEASURE_TOOLS = ["Calibrate", "Length", "Perimeter", "Area", "RectArea", "EllipseArea", "Volume", "Diameter",
+MEASURE_TOOLS = ["Calibrate", "Length", "Perimeter", "Area", "Fill", "RectArea", "EllipseArea", "Volume", "Diameter",
                  "Angle", "Count"]
 STAMPS = ["APPROVED", "REVIEWED", "REJECTED", "DRAFT", "FOR CONSTRUCTION", "VOID", "AS BUILT", "CONFIDENTIAL"]
 ERRORS = (ValueError, IndexError, RuntimeError, PermissionError, OSError, KeyError)
@@ -499,7 +499,7 @@ class Main(W.QMainWindow):
         hint = {"Length": "click points, double-click to finish", "Area": "click points, double-click to finish",
                 "Perimeter": "click points, double-click to finish", "Volume": "click points, double-click; uses Depth",
                 "Polyline": "click points, double-click to finish", "Angle": "click 3 points (vertex is the 2nd)",
-                "Calibrate": "drag across a known dimension", "Stamp": "click or drag to place",
+                "Calibrate": "drag across a known dimension", "Fill": "click inside an enclosed room (Dynamic Fill)", "Stamp": "click or drag to place",
                 "Redact": "drag area, then Document ▸ Apply redactions"}.get(name, "")
         self.statusBar().showMessage(f"{name}  {hint}")
 
@@ -1096,14 +1096,17 @@ class Main(W.QMainWindow):
     def verify_signatures(self):
         if not self._need_doc() or not self.doc.path:
             return
-        from .sign import list_signatures
+        from .sign import verify_signatures
+        roots, _ = W.QFileDialog.getOpenFileNames(self, "Trusted certificates (optional — Cancel for none)", "",
+                                                  "Certificates (*.pem *.crt *.cer *.der)")
         try:
-            sigs = list_signatures(self.doc.path)
+            sigs = verify_signatures(self.doc.path, roots)
         except Exception as e:
             return W.QMessageBox.warning(self, "Signatures", str(e))
         W.QMessageBox.information(self, "Signatures", "\n".join(
-            f"{n}: {who} — {'intact' if ok else 'MODIFIED'}, {'covers whole file' if whole else 'changes after signing'}"
-            for n, who, ok, whole in sigs) or "No signatures")
+            f"{s['field']}: {s['signer']} — " + ("VALID and TRUSTED" if s["verdict_ok"] else
+            f"NOT VERIFIED ({'intact' if s['intact'] else 'MODIFIED'}, {'trusted' if s['trusted'] else 'untrusted'}, "
+            f"{'unchanged since signing' if s['whole_file'] else 'EDITED AFTER SIGNING'})") for s in sigs) or "No signatures")
 
 
 def main(argv=None):

@@ -19,6 +19,9 @@ STATUSES = ["", "Accepted", "Rejected", "Cancelled", "Completed", "Reviewed"]
 MEASURE_KEY, STATUS_KEY, PARENT_KEY = "OR_Measure", "OR_Status", "OR_Parent"
 VERTEX_TYPES = {"Line", "PolyLine", "Polygon", "Ink"}
 RECT_TYPES = {"Square", "Circle", "FreeText", "Text", "Stamp"}
+TEXT_MARKUP_TYPES = {"Highlight", "Underline", "StrikeOut", "Squiggly"}  # move-only (quad points)
+DEPTH_KEY = "OR_Depth"
+RESIZABLE_MEASURES = {"length", "perimeter", "area", "volume", "diameter"}
 
 
 @dataclass
@@ -235,9 +238,13 @@ class Markup:
             return [[tuple(self.d._tv(pn, p)) for p in st] for st in v]
         return [tuple(self.d._tv(pn, p)) for p in v or []]
 
-    def _check_transformable(self):
-        if self.kind not in VERTEX_TYPES and self.kind not in RECT_TYPES:
-            raise ValueError(f"cannot move or resize {self.kind} markups")
+    def _check_transformable(self, resize=False):
+        k = self.kind
+        if k in TEXT_MARKUP_TYPES:
+            if resize:
+                raise ValueError("text markups follow their text; move them instead of resizing")
+        elif k not in VERTEX_TYPES and k not in RECT_TYPES:
+            raise ValueError(f"cannot move or resize {k} markups")
 
     def move(self, dx, dy):
         """Move by (dx, dy) in visual coordinates."""
@@ -247,20 +254,68 @@ class Markup:
         self._apply(self.d._ru(self.page_no, new))
 
     def resize(self, new_rect):
-        """Resize to new_rect (visual coordinates)."""
-        self._check_transformable()
-        if self.measurement():
-            raise ValueError("resizing would invalidate the measurement")
+        """Resize to new_rect (visual coordinates). Measurements are re-measured."""
+        self._check_transformable(resize=True)
+        m = self.measurement()
+        if m and (m[0] not in RESIZABLE_MEASURES or any(c.subject == "Cutout" for c in self._children_markups())):
+            raise ValueError("this measurement cannot be resized; delete and re-measure it")
         old = self.annot.rect
         if old.width == 0 or old.height == 0:
             raise ValueError("degenerate markup")
         self._edit()
         self._apply(self.d._ru(self.page_no, new_rect))
+        if m:
+            self._remeasure(m[0])
+
+    def _children_markups(self):
+        return [Markup(c, self.page_no, self._page, self.d) for c in self._children()]
+
+    def _rd(self):
+        rd = _xget(self.d.doc, self.xref, "RD")
+        return tuple(float(v) for v in rd.strip("[]").split()) if rd else (0.0, 0.0, 0.0, 0.0)
+
+    def _remeasure(self, kind):
+        """Recompute the stored value (and relabel) after the geometry changed."""
+        d, pno = self.d, self.page_no
+        sc = d.scale_for(pno)
+        if self.kind == "Circle":
+            l, t, r_, b_ = self._rd()
+            vr = self.rect
+            w, h = vr.width - l - r_, vr.height - t - b_
+            val = sc.unit_per_pt * w if kind == "diameter" else 3.141592653589793 / 4 * w * h * sc.unit_per_pt ** 2
+            center = ((vr.x0 + vr.x1) / 2, (vr.y0 + vr.y1) / 2)
+        else:
+            pts = self.points()
+            center = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+            if kind == "length":
+                val = sc.length(pts)
+                center = pts[len(pts) // 2] if len(pts) > 2 else center
+            elif kind == "perimeter":
+                val = sc.length(pts + pts[:1])
+            else:
+                val = sc.area(pts)
+                if kind == "volume":
+                    val *= float(_xget(d.doc, self.xref, DEPTH_KEY) or 1)
+        unit = self.measurement()[2]
+        d.doc.xref_set_key(self.xref, MEASURE_KEY, f"({kind}:{val:.10g}:{unit})")
+        had_label = bool(self._children())
+        for c in self._children():
+            self._page.delete_annot(c)
+        if had_label:
+            d._label(pno, center, format_value(kind, val, unit) if kind != "diameter" else f"Ø {val:.2f} {unit}", (0, 0.4, 1), self)
 
     def _apply(self, new_u: fitz.Rect, children=True):
         """Map the annotation's current (API-space) bbox onto new_u, scaling vertices accordingly."""
         a, page, doc = self.annot, self._page, self.d.doc
         old, outer_old = a.rect, a.rect
+        if self.kind in TEXT_MARKUP_TYPES:
+            rawq = _xget(doc, self.xref, "QuadPoints")
+            nums = [float(v) for v in rawq.strip("[]").split()]
+            ddx, ddy = new_u.x0 - old.x0, -(new_u.y0 - old.y0)  # PDF y axis points up
+            moved = [v + (ddx if i % 2 == 0 else ddy) for i, v in enumerate(nums)]
+            doc.xref_set_key(self.xref, "QuadPoints", "[" + " ".join(f"{v:g}" for v in moved) + "]")
+            a.update()
+            return
         if self.kind in VERTEX_TYPES:
             # a.rect is the vertex bbox plus stroke padding: scale the vertices' own bbox, keep the padding
             pts = [p for st in a.vertices for p in st] if self.kind == "Ink" else a.vertices
@@ -283,8 +338,7 @@ class Markup:
                 doc.xref_set_key(self.xref, "Vertices", "[" + raw([f(p) for p in v]) + "]")
         else:
             if self.kind in ("Square", "Circle"):  # annot.rect includes the /RD border padding; set_rect wants the inner rect
-                rd = _xget(doc, self.xref, "RD")
-                l, t, r_, b_ = [float(v) for v in rd.strip("[]").split()] if rd else (0, 0, 0, 0)
+                l, t, r_, b_ = self._rd()
                 new_u = fitz.Rect(new_u.x0 + l, new_u.y0 + t, new_u.x1 - r_, new_u.y1 - b_)
             a.set_rect(new_u)
         a.update()
@@ -363,15 +417,17 @@ class Document(PageOps):
 
     def checkpoint(self):
         self._store_scales()
-        self._undo.append(self.doc.tobytes())
+        self._undo.append(self._dump())
         del self._undo[:-self.MAX_UNDO]
-        self._redo.clear()
+        self._redo = []
         self.modified = True
 
     def _reopen(self, data: bytes):
         self._invalidate_pages()
         self.doc.close()
         self.doc = fitz.open("pdf", data)
+        if self.doc.needs_pass:
+            self.doc.authenticate(self._password)
         self.default_scale, self.page_scales = self._load_scales()
 
     def undo(self) -> bool:
@@ -392,6 +448,13 @@ class Document(PageOps):
 
     def _snapshot(self) -> bytes:
         self._store_scales()
+        return self._dump()
+
+    def _dump(self) -> bytes:
+        """Serialize for the undo history; protected documents never leave plaintext copies in memory."""
+        if self._password:
+            return self.doc.tobytes(encryption=fitz.PDF_ENCRYPT_AES_256, user_pw=self._password,
+                                    owner_pw=self._password + "-owner", permissions=-1)
         return self.doc.tobytes()
 
     # --- scales (default + per page), persisted in PDF keywords ---
@@ -656,6 +719,8 @@ class Document(PageOps):
             v, kind, txt = v * depth, "volume", f"{v * depth:.2f} {sc.unit}³"
         a = self._page(pno).add_polygon_annot(self._tus(pno, pts))
         self._finish(a, color, 1.5, subject, fill=color, opacity=0.25, measure=f"{kind}:{v:.10g}:{unit}")
+        if depth is not None:
+            self.doc.xref_set_key(a.xref, DEPTH_KEY, repr(float(depth)))
         for c in cutouts:
             ca = self._page(pno).add_polygon_annot(self._tus(pno, c))
             self._finish(ca, (0.5, 0.5, 0.5), 1, "Cutout", fill=(1, 1, 1), opacity=0.8)
@@ -663,6 +728,30 @@ class Document(PageOps):
         if label:
             self._label(pno, self._centroid(pts), txt, color, a)
         return a, v
+
+    def region_polygon(self, pno, point, max_px=4000, threshold=200):
+        """Dynamic-Fill-style: boundary (and obstacles) of the enclosed open area around `point`.
+        Returns (outer_polygon, [hole_polygons]) in visual page coordinates. Needs numpy + scipy."""
+        try:
+            import numpy as np
+            import scipy.ndimage  # noqa: F401  (checked here so a missing scipy becomes a clear error)
+            from .fill import find_region
+        except ImportError as e:
+            raise RuntimeError("region fill needs numpy and scipy: pip install openrevu[fill]") from e
+        pg = self._page(pno)
+        z = min(4.0, max_px / max(pg.rect.width, pg.rect.height))
+        pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), colorspace=fitz.csGRAY, annots=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+        outer, holes = find_region(arr > threshold, (int(point[0] * z), int(point[1] * z)), min_hole=max(30, int(z * z * 4)),
+                                   tol=max(1.0, z * 0.5))
+        conv = lambda ring: [((x + 0.5) / z, (y + 0.5) / z) for x, y in ring]  # noqa: E731
+        return conv(outer), [conv(h) for h in holes]
+
+    @_mutates
+    def add_fill_area(self, pno, point, **kw):
+        """Measure the room around `point`: area of the enclosed region minus obstacles (columns etc.)."""
+        outer, holes = self.region_polygon(pno, point)
+        return self.add_area(pno, outer, cutouts=holes, subject=kw.pop("subject", "Fill Area"), **kw)
 
     @_mutates
     def add_rect_area(self, pno, rect, **kw):

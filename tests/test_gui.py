@@ -181,3 +181,20 @@ def test_draw_select_move_on_rotated_page(win, rot):
     drag(w, 0, (150, 185), (180, 205))
     assert w.cv.selected.rect.x0 == pytest.approx(r0.x0 + 30, abs=2)
     assert w.cv.selected.rect.y0 == pytest.approx(r0.y0 + 20, abs=2)
+
+
+def test_fill_tool_measures_clicked_room(app, tmp_path):
+    pytest.importorskip("scipy")
+    d = fitz.open(); p = d.new_page(width=600, height=800)
+    p.draw_rect(fitz.Rect(100, 100, 400, 300), width=3)
+    path = tmp_path / "room.pdf"; d.save(path)
+    w = Main(str(path)); w.show(); app.processEvents()
+    w.doc.set_scale(__import__("openrevu.core", fromlist=["Scale"]).Scale("m", 0.01))
+    w.set_tool("Fill")
+    click(w, 0, 250, 200)
+    ms = [m for m in w.doc.markups() if m.measurement()]
+    assert len(ms) == 1 and ms[0].subject == "Fill Area"
+    assert ms[0].measurement()[1] * 10000 == pytest.approx(294 * 194, rel=0.03)
+    click(w, 0, 500, 600)  # outside: error reported, nothing added
+    assert len([m for m in w.doc.markups() if m.measurement()]) == 1
+    assert "enclosed" in w.statusBar().currentMessage()

@@ -248,6 +248,13 @@ class Canvas(W.QGraphicsView):
         elif t == "Count":
             self.doc.add_count(pno, pt, group=self.count_group or "Count")
             self._done([pno])
+        elif t == "Fill":
+            try:
+                _, v = self.doc.add_fill_area(pno, pt)
+                self.status.emit(f"Fill area: {v:.3f} {self.doc.scale_for(pno).unit}²")
+            except (ValueError, RuntimeError) as e:
+                self.status.emit(str(e))
+            self._done([pno])
         elif t == "Note":
             text, ok = W.QInputDialog.getText(self, "Note", "Text:")
             if ok:
