@@ -518,3 +518,23 @@ def test_unexpected_errors_show_a_dialog_instead_of_killing_the_app(app, monkeyp
     finally:
         sys.excepthook = old
     assert seen["text"] == "OpenRevu hit an unexpected problem." and "boom from a handler" in seen["details"]
+
+
+def test_import_btx_from_the_menu(win, tmp_path, monkeypatch):
+    from tests.test_btx import RECT, item, write
+    w = win
+    w.chest.path = str(tmp_path / "tc.json"); w.chest.items = {}
+    p = write(tmp_path, [item("Rect", RECT), item("Stamp", "<</Subtype/Stamp>>")])
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (p, "")))
+    shown = {}
+    monkeypatch.setattr(QtWidgets.QMessageBox, "exec_", lambda self: shown.update(text=self.text(), details=self.detailedText()) or 0)
+    w.import_btx()
+    assert shown["text"] == "1 tool(s) imported, 1 skipped." and "Stamp type cannot be a tool" in shown["details"]
+    mine = w.chest_my
+    assert [mine.child(i).text(0) for i in range(mine.childCount())] == ["Rect"]
+    bad = tmp_path / "bad.btx"; bad.write_text("not xml")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(bad), "")))
+    warned = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(lambda *a, **k: warned.append(a[2])))
+    w.import_btx()
+    assert warned and "not a readable tool set" in warned[0]

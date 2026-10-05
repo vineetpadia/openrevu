@@ -488,6 +488,7 @@ class Main(DocumentOps, W.QMainWindow):
         self._act(f, "Optimize / compress copy…", self.optimize)
         self._act(f, "Export as PDF/A…", self.export_pdfa)
         f.addSeparator()
+        self._act(f, "Import Bluebeam tool set (.btx)…", self.import_btx)
         self._act(f, "Export page as PNG…", self.export_png)
         self._act(f, "Export Markup Summary (PDF)…", self.export_summary_pdf)
         self._act(f, "Export markups list (CSV)…", lambda: self._export("csv"))
@@ -1527,6 +1528,25 @@ class Main(DocumentOps, W.QMainWindow):
             self.chest.add(n, m)
             self._refresh_chest()
             self.show_panel("Tool Chest")
+
+    def import_btx(self):
+        p, _ = W.QFileDialog.getOpenFileName(self, "Bluebeam tool set", "", "Bluebeam tool sets (*.btx);;All files (*)")
+        if not p:
+            return
+        try:
+            res = self.chest.import_btx(p)
+        except (ValueError, OSError) as e:
+            return W.QMessageBox.warning(self, "Import tool set", str(e))
+        self._refresh_chest()
+        self.show_panel("Tool Chest")
+        box = W.QMessageBox(self)
+        box.setWindowTitle("Import tool set")
+        box.setIcon(W.QMessageBox.Information if res.imported else W.QMessageBox.Warning)
+        box.setText(res.summary())
+        if res.skipped:
+            box.setInformativeText("Some tools could not be imported. Press Show Details to see why.")
+            box.setDetailedText("\n".join(f"{n}: {why}" for n, why in res.skipped))
+        box.exec_()
 
     def chest_remove(self):
         it = self.chest_tree.currentItem()
