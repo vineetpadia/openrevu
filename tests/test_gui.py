@@ -396,3 +396,59 @@ def test_feet_inches_menu_toggle_redraws_labels_and_shows_in_the_list(win):
     assert "12' 6 1/2\"" in w.totals.text()
     w.undo()
     assert w.doc.unit_style == "decimal" and not w.act_arch.isChecked()      # the menu follows the document
+
+
+# ---------- custom columns and the Markup Summary ----------
+def test_custom_columns_in_the_list_and_the_properties_panel(win, monkeypatch):
+    w = win
+    w.doc.add_rect(0, fitz.Rect(100, 200, 200, 260)); w._after_change()
+    answers = iter([{"Name": "Cost", "Type (text, number, choice)": "number", "Choices (separate with commas)": ""},
+                    {"Name": "Trade", "Type (text, number, choice)": "choice", "Choices (separate with commas)": "Electrical, Plumbing"}])
+    monkeypatch.setattr(w, "_form_dialog", lambda *a, **k: next(answers))
+    w.add_column_dialog(); w.add_column_dialog()
+    headers = [w.mk_table.horizontalHeaderItem(i).text() for i in range(w.mk_table.columnCount())]
+    assert headers[-2:] == ["Cost", "Trade"] and set(w.p_custom_editors) == {"Cost", "Trade"}
+    assert not any(ed.isEnabled() for _c, ed in w.p_custom_editors.values())      # nothing selected yet
+    w.cv.select(w.doc.markups()[0])
+    cost, trade = w.p_custom_editors["Cost"][1], w.p_custom_editors["Trade"][1]
+    assert cost.isEnabled() and trade.isEnabled() and [trade.itemText(i) for i in range(trade.count())] == ["", "Electrical", "Plumbing"]
+    cost.setText("1250.5"); cost.editingFinished.emit()
+    trade.setCurrentText("Plumbing"); trade.activated.emit(2)
+    assert w.doc.markups()[0].custom() == {"Cost": 1250.5, "Trade": "Plumbing"}
+    row = [w.mk_table.item(0, c).text() for c in range(w.mk_table.columnCount())]
+    assert row[-2:] == ["1250.5", "Plumbing"]
+    w.mk_filter.setText("plumb"); assert w.mk_table.rowCount() == 1
+    w.mk_filter.setText("nothing"); assert w.mk_table.rowCount() == 0
+    w.mk_filter.setText("")
+    cost.setText("abc"); cost.editingFinished.emit()                               # a bad number is refused with a message
+    assert "needs a number" in w.statusBar().currentMessage() and w.doc.markups()[0].custom()["Cost"] == 1250.5
+    assert cost.text() == "1250.5"                                                 # and the field shows the stored value again
+    w.remove_column("Cost")
+    assert [w.mk_table.horizontalHeaderItem(i).text() for i in range(w.mk_table.columnCount())][-1] == "Trade" and "Cost" not in w.p_custom_editors
+    w.undo()
+    assert "Cost" in w.p_custom_editors and w.doc.markups()[0].custom()["Cost"] == 1250.5
+
+
+def test_header_menu_lists_add_and_remove(win):
+    w = win
+    w.doc.add_column("Cost", "number"); w._after_change()
+    called = {}
+    import openrevu.gui as G
+    orig = G.W.QMenu.exec_
+    G.W.QMenu.exec_ = lambda self, *a: called.update(actions=[x.text() for x in self.actions()]) or None
+    try:
+        w._header_menu(QtCore.QPoint(5, 5))
+    finally:
+        G.W.QMenu.exec_ = orig
+    assert called["actions"] == ["Add column…", "Remove column"]
+
+
+def test_export_markup_summary_from_the_menu(win, tmp_path, monkeypatch):
+    w = win
+    w.doc.add_rect(0, fitz.Rect(100, 200, 200, 260)); w.doc.markups()[0].set_comment("see this"); w._after_change()
+    out = str(tmp_path / "sum.pdf")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (out, "")))
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", staticmethod(lambda *a, **k: ("No", True)))
+    w.export_summary_pdf()
+    assert "Markup Summary saved: 1 markup" in w.statusBar().currentMessage()
+    assert "see this" in fitz.open(out)[0].get_text() and fitz.open(out)[0].get_images() == []

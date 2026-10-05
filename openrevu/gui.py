@@ -361,8 +361,13 @@ class Main(DocumentOps, W.QMainWindow):
         self.p_info.setWordWrap(True)
         self.p_info.setStyleSheet("color: #666;")
         pl.addRow(self.p_info)
-        for lbl, w in (("Subject", self.p_subject), ("Comment", self.p_comment), ("Status", self.p_status),
-                       ("Replies", self.p_replies), ("", self.p_reply)):
+        self.p_custom_form = W.QFormLayout()          # one editor for each custom column
+        self.p_custom_editors: dict = {}
+        self._cols_sig = None
+        for lbl, w in (("Subject", self.p_subject), ("Comment", self.p_comment), ("Status", self.p_status)):
+            pl.addRow(lbl, w)
+        pl.addRow(self.p_custom_form)
+        for lbl, w in (("Replies", self.p_replies), ("", self.p_reply)):
             pl.addRow(lbl, w)
         self.p_subject.editingFinished.connect(lambda: self._prop(lambda m: m.set_subject(self.p_subject.text())))
         self.p_comment.installEventFilter(self)
@@ -431,6 +436,10 @@ class Main(DocumentOps, W.QMainWindow):
         self.mk_table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.mk_table.customContextMenuRequested.connect(self._table_menu)
         self.mk_table.itemSelectionChanged.connect(self._table_select)
+        hh = self.mk_table.horizontalHeader()
+        hh.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        hh.customContextMenuRequested.connect(self._header_menu)
+        hh.setToolTip("Right-click to add or remove a column")
         self.mk_filter.textChanged.connect(self.refresh_markups)
         self.mk_status.currentIndexChanged.connect(self.refresh_markups)
         mkl.addWidget(self.mk_table)
@@ -476,6 +485,7 @@ class Main(DocumentOps, W.QMainWindow):
         self._act(f, "Export as PDF/A…", self.export_pdfa)
         f.addSeparator()
         self._act(f, "Export page as PNG…", self.export_png)
+        self._act(f, "Export Markup Summary (PDF)…", self.export_summary_pdf)
         self._act(f, "Export markups list (CSV)…", lambda: self._export("csv"))
         self._act(f, "Export measurement summary (CSV)…", lambda: self._export("summary"))
         self._act(f, "Print…", self.print_doc, "Ctrl+P", tool_icon("print"))
@@ -1042,6 +1052,9 @@ class Main(DocumentOps, W.QMainWindow):
         t.setRowCount(0)
         self.meas_table.setRowCount(0)
         d = self.doc
+        cols = d.columns if d else []
+        t.setColumnCount(7 + len(cols))
+        t.setHorizontalHeaderLabels(["Page", "Subject", "Type", "Author", "Status", "Comment", "Value"] + [c["name"] for c in cols])
         if d:
             q, st = self.mk_filter.text().lower(), self.mk_status.currentIndex()
             for m in d.markups():
@@ -1050,7 +1063,9 @@ class Main(DocumentOps, W.QMainWindow):
                     continue
                 r = m.measurement()
                 val = d.fmt(*r) if r else ""
-                row = [str(m.page_no + 1), m.subject, m.kind, m.author, status, m.comment, val]
+                cv = m.custom()
+                row = [str(m.page_no + 1), m.subject, m.kind, m.author, status, m.comment, val] \
+                    + [("%g" % cv[c["name"]]) if isinstance(cv.get(c["name"]), float) else str(cv.get(c["name"], "")) for c in cols]
                 if q and q not in " ".join(row).lower():
                     continue
                 i = t.rowCount()
@@ -1067,6 +1082,7 @@ class Main(DocumentOps, W.QMainWindow):
                 for c, v in enumerate((subj, str(n), d.fmt(kind, tot, unit).split(" ")[0], {"area": f"{unit}²", "volume": f"{unit}³"}.get(kind, unit))):
                     self.meas_table.setItem(k, c, W.QTableWidgetItem(v))
         t.setSortingEnabled(True)
+        self._rebuild_custom_fields()
         if d:
             lines = [f"{k.title()}: {d.fmt(k, v, u)}" for (k, u), v in sorted(d.takeoff().items())]
             self.totals.setText("Totals — " + ("; ".join(lines) if lines else "no measurements yet"))
@@ -1237,9 +1253,19 @@ class Main(DocumentOps, W.QMainWindow):
                 self.w_opacity.setValue(m.annot.opacity if m.annot.opacity >= 0 else 1)
                 for a, t in m.replies():
                     self.p_replies.addItem(f"{a}: {t}")
+                cv = m.custom()
+                for name, (col, ed) in self.p_custom_editors.items():
+                    val = cv.get(name, "")
+                    val = "%g" % val if isinstance(val, float) else str(val)
+                    ed.blockSignals(True)
+                    (ed.setCurrentText if isinstance(ed, W.QComboBox) else ed.setText)(val)
+                    ed.blockSignals(False)
+                    ed.setEnabled(True)
             except Exception:
                 pass
         else:
+            for _col, ed in self.p_custom_editors.values():
+                ed.setEnabled(False)
             self.p_info.setText("Select a markup to see its properties.")
             self.p_subject.clear()
             self.p_comment.clear()
@@ -1260,9 +1286,67 @@ class Main(DocumentOps, W.QMainWindow):
         try:
             fn(m)
         except ERRORS as e:
-            return self.statusBar().showMessage(str(e))
+            self.statusBar().showMessage(str(e))
+            return self._load_props()          # put the stored value back into the field that was refused
         self.cv.invalidate([m.page_no])
         self._after_change()
+
+    def _rebuild_custom_fields(self):
+        """One editor per custom column in the Properties panel. Rebuilt only when the columns change."""
+        cols = self.doc.columns if self.doc else []
+        sig = repr(cols)
+        if sig == self._cols_sig:
+            return
+        self._cols_sig = sig
+        while self.p_custom_form.rowCount():
+            self.p_custom_form.removeRow(0)
+        self.p_custom_editors = {}
+        for col in cols:
+            if col["type"] == "choice":
+                ed = W.QComboBox()
+                ed.addItems([""] + col["choices"])
+                ed.activated.connect(lambda _i, n=col["name"], e=ed: self._prop(lambda m: m.set_custom(n, e.currentText())))
+            else:
+                ed = W.QLineEdit(placeholderText="number" if col["type"] == "number" else "")
+                ed.editingFinished.connect(lambda n=col["name"], e=ed: self._prop(lambda m: m.set_custom(n, e.text())))
+            ed.setEnabled(False)
+            self.p_custom_form.addRow(col["name"], ed)
+            self.p_custom_editors[col["name"]] = (col, ed)
+
+    def _header_menu(self, pos):
+        if not self._need_doc():
+            return
+        menu = W.QMenu(self)
+        menu.addAction(tool_icon("add"), "Add column…").triggered.connect(self.add_column_dialog)
+        if self.doc.columns:
+            rm = menu.addMenu(tool_icon("delete"), "Remove column")
+            for c in self.doc.columns:
+                rm.addAction(c["name"]).triggered.connect(lambda _=False, n=c["name"]: self.remove_column(n))
+        menu.exec_(self.mk_table.horizontalHeader().mapToGlobal(pos))
+
+    def add_column_dialog(self):
+        if not self._need_doc():
+            return
+        v = self._form_dialog("Add a column", [("Name", ""), ("Type (text, number, choice)", "text"), ("Choices (separate with commas)", "")])
+        if v and self._run(self.doc.add_column, v["Name"], v["Type (text, number, choice)"].strip().lower(),
+                           v["Choices (separate with commas)"].split(",")) is not None:
+            self.refresh_markups()
+
+    def remove_column(self, name):
+        if self._need_doc() and self._run(self.doc.remove_column, name) is not None:
+            self.refresh_markups()
+
+    def export_summary_pdf(self):
+        if not self._need_doc():
+            return
+        mode, ok = W.QInputDialog.getItem(self, "Markup Summary", "Include a picture of each markup?", ["Yes", "No"], 0, False)
+        if not ok:
+            return
+        p, _ = W.QFileDialog.getSaveFileName(self, "Save the Markup Summary", "markup-summary.pdf", "PDF (*.pdf)")
+        if p:
+            n = self._run(self.doc.export_markup_summary, p, mode == "Yes")
+            if n is not None:
+                self.statusBar().showMessage(f"Markup Summary saved: {n} markup(s).")
 
     def _add_reply(self):
         m = self._selected()

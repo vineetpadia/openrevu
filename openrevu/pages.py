@@ -384,6 +384,12 @@ class PageOps:
                 except Exception:
                     pass
 
+    def export_markup_summary(self, path, include_images=True, statuses=None):
+        """Write a PDF report of the markups (page, subject, author, status, comment, replies, measurement,
+        custom columns, and a picture). statuses limits the report, for example ["Accepted"]. Returns the count."""
+        from .report import markup_summary_pdf
+        return markup_summary_pdf(self, path, include_images, statuses)
+
     def optimize(self, path):
         """Save with maximum structural compression; returns (before, after) byte sizes."""
         self._store_scales()

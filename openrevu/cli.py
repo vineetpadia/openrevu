@@ -40,6 +40,7 @@ def main(argv=None) -> int:
     add("run", "run a Python script with `doc` (an openrevu Document) preloaded; saves to output", out) \
         .add_argument("script")
     add("pdfa", "export a PDF/A copy (needs Ghostscript; checked with veraPDF if installed)", out, (("--level",), {"default": "2b", "choices": ["1b", "2b", "3b"]}))
+    add("report", "Markup Summary report (PDF)", out, (("--no-images",), {"action": "store_true"}), (("--status",), {"action": "append", "default": None, "help": "only this status; use several times, '' for none"}))
     add("sheets", "auto-bookmark sheet numbers and link sheet references", out)
     add("footer", "page x of y footer", out)
     a = p.parse_args(argv)
@@ -79,6 +80,8 @@ def main(argv=None) -> int:
             d.export_summary_csv(a.output)
         elif a.cmd == "numbering":
             d.bates(a.prefix, a.start); d.save(a.output)
+        elif a.cmd == "report":
+            print(f"{d.export_markup_summary(a.output, not a.no_images, a.status)} markup(s) in the report")
         elif a.cmd == "pdfa":
             rep = d.export_pdfa(a.output, a.level)
             print(rep.summary())

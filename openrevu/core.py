@@ -1,6 +1,7 @@
 """Qt-free core: PDF markup, scale calibration, takeoff, undo/redo."""
 from __future__ import annotations
 
+import base64
 import csv
 import getpass
 import json
@@ -22,6 +23,9 @@ VERTEX_TYPES = {"Line", "PolyLine", "Polygon", "Ink"}
 RECT_TYPES = {"Square", "Circle", "FreeText", "Text", "Stamp"}
 TEXT_MARKUP_TYPES = {"Highlight", "Underline", "StrikeOut", "Squiggly"}  # move-only (quad points)
 DEPTH_KEY = "OR_Depth"
+CUSTOM_KEY = "OR_Custom"
+COLUMN_TYPES = ("text", "number", "choice")
+BASE_COLUMNS = ("Page", "Subject", "Type", "Author", "Status", "Comment", "Value")
 RECREATABLE_KINDS = {"Square", "Circle", "Line", "PolyLine", "Polygon", "Ink", "FreeText", "Text"}  # can be copied / saved as tools
 RESIZABLE_MEASURES = {"length", "perimeter", "area", "volume", "diameter", "angle"}
 
@@ -203,6 +207,40 @@ class Markup:
             return None
         kind, val, unit = v.split(":", 2)
         return kind, float(val), unit
+
+    def custom(self) -> dict:
+        """Values of the custom columns that are set on this markup."""
+        v = _xget(self.d.doc, self.xref, CUSTOM_KEY)
+        if not v:
+            return {}
+        try:
+            return json.loads(base64.b64decode(v).decode("utf-8"))
+        except (ValueError, TypeError):
+            return {}
+
+    def set_custom(self, name: str, value) -> None:
+        """Set a custom column value. An empty value clears it. Numbers and choices are checked."""
+        col = next((c for c in self.d.columns if c["name"] == name), None)
+        if col is None:
+            raise KeyError(f"no custom column named {name!r}")
+        if value in (None, ""):
+            value = None
+        elif col["type"] == "number":
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{name!r} needs a number, not {value!r}") from None
+        elif col["type"] == "choice":
+            if value not in col["choices"]:
+                raise ValueError(f"{value!r} is not one of {col['choices']}")
+        else:
+            value = str(value)
+        self._edit()
+        vals = {k: v for k, v in self.custom().items() if k != name}
+        if value is not None:
+            vals[name] = value
+        enc = base64.b64encode(json.dumps(vals, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        self.d.doc.xref_set_key(self.xref, CUSTOM_KEY, f"({enc})" if vals else "null")
 
     def replies(self):
         out = []
@@ -427,6 +465,7 @@ class Document(SheetOps, PageOps):
         self._pcache: dict[int, fitz.Page] = {}
         self.viewports: list = []
         self.unit_style, self.fraction = "decimal", 16
+        self.columns: list = []   # custom Markups List columns: {"name", "type", "choices"}
         self._undo: list[bytes] = []
         self._redo: list[bytes] = []
         self.modified = False
@@ -516,6 +555,7 @@ class Document(SheetOps, PageOps):
     # --- scales (default + per page), persisted in PDF keywords ---
     def _load_scales(self):
         self.viewports = []
+        self.columns = []
         kw = (self.doc.metadata or {}).get("keywords") or ""
         for part in kw.split(";"):
             if part.startswith(TAG + "-scales="):
@@ -524,6 +564,7 @@ class Document(SheetOps, PageOps):
                     self.viewports = [(int(v["page"]), fitz.Rect(v["rect"]), Scale.from_dict(v["scale"]))
                                       for v in d.get("viewports", [])]
                     self.unit_style, self.fraction = d.get("style", "decimal"), int(d.get("fraction", 16))
+                    self.columns = list(d.get("columns", []))
                     return Scale.from_dict(d["default"]), {int(k): Scale.from_dict(v) for k, v in d["pages"].items()}
                 except (ValueError, KeyError, TypeError):
                     pass
@@ -534,7 +575,7 @@ class Document(SheetOps, PageOps):
         kw = [p for p in (md.get("keywords") or "").split(";") if p and not p.startswith(TAG + "-scale")]
         blob = {"default": self.default_scale.to_dict(), "pages": {str(k): v.to_dict() for k, v in self.page_scales.items()},
                 "viewports": [{"page": p, "rect": list(r), "scale": sc.to_dict()} for p, r, sc in self.viewports],
-                "style": self.unit_style, "fraction": self.fraction}
+                "style": self.unit_style, "fraction": self.fraction, "columns": self.columns}
         kw.append(f"{TAG}-scales={json.dumps(blob)}")
         md["keywords"] = ";".join(kw)
         self.doc.set_metadata(md)
@@ -565,6 +606,46 @@ class Document(SheetOps, PageOps):
                 m._remeasure(r[0])
                 n += 1
         return n
+
+    @_mutates
+    def add_column(self, name: str, type: str = "text", choices=()):
+        """Add a custom column to the Markups List (text, number, or choice)."""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("the column needs a name")
+        if name in BASE_COLUMNS or any(c["name"] == name for c in self.columns):
+            raise ValueError(f"a column named {name!r} already exists")
+        if type not in COLUMN_TYPES:
+            raise ValueError(f"the column type must be one of {COLUMN_TYPES}")
+        choices = [c.strip() for c in choices if c.strip()]
+        if type == "choice" and not choices:
+            raise ValueError("a choice column needs at least one choice")
+        self.columns.append({"name": name, "type": type, "choices": choices if type == "choice" else []})
+
+    @_mutates
+    def remove_column(self, name: str):
+        """Remove a custom column and the values stored in it."""
+        if not any(c["name"] == name for c in self.columns):
+            raise KeyError(name)
+        self.columns = [c for c in self.columns if c["name"] != name]
+        for m in self.markups():
+            vals = m.custom()
+            if name in vals:
+                del vals[name]
+                enc = base64.b64encode(json.dumps(vals, ensure_ascii=False).encode("utf-8")).decode("ascii")
+                self.doc.xref_set_key(m.xref, CUSTOM_KEY, f"({enc})" if vals else "null")
+
+    def column_totals(self, name: str) -> dict:
+        """Sum of a number column, per subject: {subject: total}."""
+        col = next((c for c in self.columns if c["name"] == name), None)
+        if col is None or col["type"] != "number":
+            raise ValueError(f"{name!r} is not a number column")
+        out: dict = {}
+        for m in self.markups():
+            v = m.custom().get(name)
+            if v is not None:
+                out[m.subject] = out.get(m.subject, 0.0) + v
+        return out
 
     def scale_at(self, pno: int, pts) -> Scale:
         """Scale that applies at the centroid of pts: the innermost-last viewport containing it, else the page scale."""
@@ -951,12 +1032,15 @@ class Document(SheetOps, PageOps):
     def export_csv(self, path):
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["page", "type", "subject", "author", "status", "comment", "replies", "measure", "value", "unit"])
+            w.writerow(["page", "type", "subject", "author", "status", "comment", "replies", "measure", "value", "unit"]
+                       + [c["name"] for c in self.columns])
             for m in self.markups():
                 r = m.measurement()
+                cv = m.custom()
                 w.writerow([m.page_no + 1, m.kind, m.subject, m.author, m.status, m.comment,
                             " | ".join(f"{a}: {t}" for a, t in m.replies()),
-                            r[0] if r else "", f"{r[1]:.4f}" if r else "", r[2] if r else ""])
+                            r[0] if r else "", f"{r[1]:.4f}" if r else "", r[2] if r else ""]
+                           + [cv.get(c["name"], "") for c in self.columns])
 
     def export_summary_csv(self, path):
         with open(path, "w", newline="") as f:
