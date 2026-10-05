@@ -1,7 +1,8 @@
-"""Qt-free core: PDF markup, scale calibration and takeoff measurements."""
+"""Qt-free core: PDF markup, scale calibration, takeoff, undo/redo."""
 from __future__ import annotations
 
 import csv
+import getpass
 import json
 import math
 import os
@@ -9,16 +10,22 @@ from dataclasses import dataclass
 
 import fitz  # PyMuPDF
 
+from ._util import mutates as _mutates
+from .pages import PageOps
+
 TAG = "OpenRevu"
-UNITS = {"mm": 1 / 25.4, "cm": 1 / 2.54, "m": 1 / 0.0254, "in": 1.0, "ft": 1 / 12.0}
-PT_PER_IN = 72.0
+UNITS = {"mm": 1 / 25.4, "cm": 1 / 2.54, "m": 1 / 0.0254, "in": 1.0, "ft": 1 / 12.0, "yd": 1 / 36.0}
+STATUSES = ["", "Accepted", "Rejected", "Cancelled", "Completed", "Reviewed"]
+MEASURE_KEY, STATUS_KEY, PARENT_KEY = "OR_Measure", "OR_Status", "OR_Parent"
+VERTEX_TYPES = {"Line", "PolyLine", "Polygon", "Ink"}
+RECT_TYPES = {"Square", "Circle", "FreeText", "Text", "Stamp"}
 
 
 @dataclass
 class Scale:
-    """Maps PDF points to real-world units. unit_per_pt * points = real length."""
+    """Maps PDF points to real-world units: real = unit_per_pt * points."""
     unit: str = "ft"
-    unit_per_pt: float = 1 / PT_PER_IN / 12  # default: 1 pt = 1/72 in paper == 1:1
+    unit_per_pt: float = 1 / 72 / 12  # 1 pt == 1/72 in, i.e. 1:1 paper
 
     @classmethod
     def from_calibration(cls, p1, p2, real_length: float, unit: str) -> "Scale":
@@ -29,23 +36,37 @@ class Scale:
             raise ValueError(f"unknown unit {unit!r}")
         return cls(unit, real_length / d)
 
+    @classmethod
+    def from_ratio(cls, paper_in: float, real: float, unit: str) -> "Scale":
+        """e.g. 1/4 in on paper = 1 ft real: from_ratio(0.25, 1, 'ft')."""
+        if paper_in <= 0 or real <= 0 or unit not in UNITS:
+            raise ValueError("invalid ratio")
+        return cls(unit, real / (paper_in * 72))
+
     def length(self, pts) -> float:
         return sum(math.dist(a, b) for a, b in zip(pts, pts[1:])) * self.unit_per_pt
 
     def area(self, pts) -> float:
         return polygon_area(pts) * self.unit_per_pt ** 2
 
+    def to_dict(self):
+        return {"unit": self.unit, "unit_per_pt": self.unit_per_pt}
+
+    @classmethod
+    def from_dict(cls, d) -> "Scale":
+        return cls(d["unit"], float(d["unit_per_pt"]))
+
     def to_json(self) -> str:
-        return json.dumps({"unit": self.unit, "unit_per_pt": self.unit_per_pt})
+        return json.dumps(self.to_dict())
 
     @classmethod
     def from_json(cls, s: str) -> "Scale":
-        d = json.loads(s)
-        return cls(d["unit"], float(d["unit_per_pt"]))
+        return cls.from_dict(json.loads(s))
 
 
 def polygon_area(pts) -> float:
     """Shoelace formula, absolute value."""
+    pts = list(pts)
     if len(pts) < 3:
         return 0.0
     s = 0.0
@@ -54,16 +75,24 @@ def polygon_area(pts) -> float:
     return abs(s) / 2
 
 
+def angle_deg(a, b, c) -> float:
+    """Angle at vertex b between rays b->a and b->c, degrees in [0, 180]."""
+    v1, v2 = (a[0] - b[0], a[1] - b[1]), (c[0] - b[0], c[1] - b[1])
+    n = math.hypot(*v1) * math.hypot(*v2)
+    if n == 0:
+        raise ValueError("degenerate angle")
+    return math.degrees(math.acos(max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / n))))
+
+
 def cloud_points(rect: fitz.Rect, arc: float = 14.0, steps: int = 6):
     """Closed polyline of outward scallops around rect (revision cloud)."""
     r = fitz.Rect(rect).normalize()
     corners = [r.tl, r.tr, r.br, r.bl, r.tl]
     pts = []
     for a, b in zip(corners, corners[1:]):
-        length = math.dist(a, b)
-        n = max(1, round(length / arc))
+        n = max(1, round(math.dist(a, b) / arc))
         dx, dy = (b.x - a.x) / n, (b.y - a.y) / n
-        nx, ny = dy, -dx  # outward for clockwise tl->tr->br->bl
+        nx, ny = dy, -dx
         for i in range(n):
             sx, sy = a.x + dx * i, a.y + dy * i
             for k in range(steps):
@@ -74,11 +103,25 @@ def cloud_points(rect: fitz.Rect, arc: float = 14.0, steps: int = 6):
     return pts
 
 
-class Markup:
-    """Wraps a PDF annotation with an OpenRevu measurement/label payload."""
+def _pdf_pts(page, pts) -> str:
+    inv = ~page.transformation_matrix
+    return " ".join(f"{q.x:g} {q.y:g}" for q in (fitz.Point(p) * inv for p in pts))
 
-    def __init__(self, annot: fitz.Annot, page_no: int, page: fitz.Page):
-        self.annot, self.page_no, self._page = annot, page_no, page  # keep page alive
+
+def _xget(doc, xref, key):
+    t, v = doc.xref_get_key(xref, key)
+    return None if t == "null" else v
+
+
+class Markup:
+    """A PDF annotation plus OpenRevu metadata (measurement, status, replies)."""
+
+    def __init__(self, annot: fitz.Annot, page_no: int, page: fitz.Page, d: "Document"):
+        self.annot, self.page_no, self._page, self.d = annot, page_no, page, d  # keep page alive
+
+    @property
+    def xref(self) -> int:
+        return self.annot.xref
 
     @property
     def kind(self) -> str:
@@ -92,174 +135,594 @@ class Markup:
     def comment(self) -> str:
         return self.annot.info.get("content", "")
 
+    @property
+    def author(self) -> str:
+        return self.annot.info.get("title", "")
+
+    @property
+    def date(self) -> str:
+        return self.annot.info.get("modDate", "") or self.annot.info.get("creationDate", "")
+
+    @property
+    def rect(self) -> fitz.Rect:
+        return self.annot.rect
+
+    @property
+    def status(self) -> str:
+        v = _xget(self.d.doc, self.xref, STATUS_KEY)
+        return v or ""
+
     def measurement(self):
-        """Return (kind, value, unit) if this is a measurement markup, else None."""
-        c = self.comment
-        if c.startswith(TAG + ":"):
-            _, kind, val, unit = c.split(":", 3)
-            return kind, float(val), unit
-        return None
+        """(kind, value, unit) if this is a measurement markup, else None."""
+        v = _xget(self.d.doc, self.xref, MEASURE_KEY)
+        if not v:
+            return None
+        kind, val, unit = v.split(":", 2)
+        return kind, float(val), unit
+
+    def replies(self):
+        out = []
+        for a in self._page.annots() or []:
+            if _xget(self.d.doc, a.xref, "IRT") == f"{self.xref} 0 R":
+                out.append((a.info.get("title", ""), a.info.get("content", "")))
+        return out
+
+    # --- editing (each checkpoints for undo) ---
+    def _edit(self):
+        self.d.checkpoint()
+
+    def set_colors(self, stroke=None, fill=None):
+        self._edit()
+        kw = {}
+        if stroke is not None:
+            kw["stroke"] = stroke
+        if fill is not None:
+            kw["fill"] = fill
+        self.annot.set_colors(**kw)
+        self.annot.update()
+
+    def set_width(self, w):
+        self._edit()
+        self.annot.set_border(width=w)
+        self.annot.update()
+
+    def set_opacity(self, o):
+        self._edit()
+        self.annot.set_opacity(o)
+        self.annot.update()
+
+    def set_subject(self, s):
+        self._edit()
+        self.annot.set_info(subject=s)
+        self.annot.update()
+
+    def set_comment(self, c):
+        self._edit()
+        self.annot.set_info(content=c)
+        self.annot.update()
+
+    def set_status(self, s):
+        if s not in STATUSES:
+            raise ValueError(f"unknown status {s!r}")
+        self._edit()
+        if s:
+            self.d.doc.xref_set_key(self.xref, STATUS_KEY, f"({s})")
+        else:
+            self.d.doc.xref_set_key(self.xref, STATUS_KEY, "null")
+
+    def _children(self):
+        return [a for a in self._page.annots() or []
+                if _xget(self.d.doc, a.xref, PARENT_KEY) == str(self.xref)]
+
+    def points(self):
+        """Geometry as flat list of (x, y); for Ink, list of strokes."""
+        return self.annot.vertices
+
+    def transform(self, dx=0.0, dy=0.0, sx=1.0, sy=1.0):
+        """Scale about the bbox top-left by (sx, sy), then translate by (dx, dy)."""
+        self._edit()
+        self._transform(dx, dy, sx, sy)
+
+    def _transform(self, dx, dy, sx, sy):
+        a, page = self.annot, self._page
+        r = a.rect
+        ox, oy = r.x0, r.y0
+
+        def f(p):
+            return (ox + (p[0] - ox) * sx + dx, oy + (p[1] - oy) * sy + dy)
+
+        if self.kind in VERTEX_TYPES:
+            v = a.vertices
+            if self.kind == "Ink":
+                s = "[" + "".join("[" + _pdf_pts(page, [f(p) for p in st]) + "]" for st in v) + "]"
+                self.d.doc.xref_set_key(self.xref, "InkList", s)
+            elif self.kind == "Line":
+                self.d.doc.xref_set_key(self.xref, "L", "[" + _pdf_pts(page, [f(p) for p in v]) + "]")
+            else:
+                self.d.doc.xref_set_key(self.xref, "Vertices", "[" + _pdf_pts(page, [f(p) for p in v]) + "]")
+        elif self.kind in RECT_TYPES:
+            nr = fitz.Rect(*f((r.x0, r.y0)), *f((r.x1, r.y1)))
+            a.set_rect(nr)
+        else:
+            raise ValueError(f"cannot transform {self.kind} markups")
+        a.update()
+        if (sx, sy) == (1.0, 1.0):
+            for c in self._children():
+                Markup(c, self.page_no, page, self.d)._transform(dx, dy, 1.0, 1.0)
+
+    def move(self, dx, dy):
+        self.transform(dx, dy)
+
+    def resize(self, new_rect):
+        if self.measurement():
+            raise ValueError("resizing would invalidate the measurement")
+        r = self.annot.rect
+        if r.width == 0 or r.height == 0:
+            raise ValueError("degenerate markup")
+        new_rect = fitz.Rect(new_rect).normalize()
+        self.transform(new_rect.x0 - r.x0, new_rect.y0 - r.y0, new_rect.width / r.width, new_rect.height / r.height)
+
+    def to_dict(self):
+        """Serialisable description (for tool chest / copy-paste)."""
+        a = self.annot
+        c = a.colors
+        return {
+            "kind": self.kind, "subject": self.subject, "comment": self.comment,
+            "stroke": c.get("stroke"), "fill": c.get("fill"), "width": a.border.get("width", 1),
+            "opacity": a.opacity, "rect": list(a.rect),
+            "vertices": [[list(p) for p in s] for s in a.vertices] if self.kind == "Ink"
+            else ([list(p) for p in a.vertices] if a.vertices else None),
+            "arrow": bool(a.line_ends and a.line_ends[1] == fitz.PDF_ANNOT_LE_CLOSED_ARROW)
+            if self.kind == "Line" else False,
+        }
 
 
-class Document:
-    def __init__(self, path: str | None = None):
+class Document(PageOps):
+
+    def __init__(self, path: str | None = None, password: str | None = None):
         self.doc = fitz.open(path) if path else fitz.open()
+        if self.doc.needs_pass and not (password and self.doc.authenticate(password)):
+            raise PermissionError("password required or incorrect")
         self.path = path
-        self.scale = self._load_scale()
+        self.author = getpass.getuser()
+        self._depth = 0
+        self._undo: list[bytes] = []
+        self._redo: list[bytes] = []
+        self.modified = False
+        self.default_scale, self.page_scales = self._load_scales()
 
-    # --- scale persistence (stored in PDF keywords) ---
-    def _load_scale(self) -> Scale:
+    # --- undo / redo ---
+    MAX_UNDO = 30
+
+    def checkpoint(self):
+        self._store_scales()
+        self._undo.append(self.doc.tobytes())
+        del self._undo[:-self.MAX_UNDO]
+        self._redo.clear()
+        self.modified = True
+
+    def _reopen(self, data: bytes):
+        self.doc.close()
+        self.doc = fitz.open("pdf", data)
+        self.default_scale, self.page_scales = self._load_scales()
+
+    def undo(self) -> bool:
+        if not self._undo:
+            return False
+        self._redo.append(self._snapshot())
+        self._reopen(self._undo.pop())
+        self.modified = True
+        return True
+
+    def redo(self) -> bool:
+        if not self._redo:
+            return False
+        self._undo.append(self._snapshot())
+        self._reopen(self._redo.pop())
+        self.modified = True
+        return True
+
+    def _snapshot(self) -> bytes:
+        self._store_scales()
+        return self.doc.tobytes()
+
+    # --- scales (default + per page), persisted in PDF keywords ---
+    def _load_scales(self):
         kw = (self.doc.metadata or {}).get("keywords") or ""
         for part in kw.split(";"):
-            if part.startswith(TAG + "-scale="):
+            if part.startswith(TAG + "-scales="):
                 try:
-                    return Scale.from_json(part.split("=", 1)[1])
-                except (ValueError, KeyError):
+                    d = json.loads(part.split("=", 1)[1])
+                    return Scale.from_dict(d["default"]), {int(k): Scale.from_dict(v) for k, v in d["pages"].items()}
+                except (ValueError, KeyError, TypeError):
                     pass
-        return Scale()
+        return Scale(), {}
 
-    def set_scale(self, scale: Scale):
-        self.scale = scale
-
-    def _store_scale(self):
+    def _store_scales(self):
         md = dict(self.doc.metadata or {})
-        kw = [p for p in (md.get("keywords") or "").split(";") if p and not p.startswith(TAG + "-scale=")]
-        kw.append(f"{TAG}-scale={self.scale.to_json()}")
+        kw = [p for p in (md.get("keywords") or "").split(";") if p and not p.startswith(TAG + "-scale")]
+        blob = {"default": self.default_scale.to_dict(), "pages": {str(k): v.to_dict() for k, v in self.page_scales.items()}}
+        kw.append(f"{TAG}-scales={json.dumps(blob)}")
         md["keywords"] = ";".join(kw)
         self.doc.set_metadata(md)
+
+    @property
+    def scale(self) -> Scale:
+        return self.default_scale
+
+    def scale_for(self, pno: int) -> Scale:
+        return self.page_scales.get(pno, self.default_scale)
+
+    def set_scale(self, scale: Scale, page: int | None = None, pages=None):
+        """Set the default scale, or the scale of one page / a list of pages."""
+        self.checkpoint()
+        if pages is not None or page is not None:
+            for p in ([page] if pages is None else pages):
+                self.page_scales[p] = scale
+        else:
+            self.default_scale = scale
 
     @property
     def page_count(self) -> int:
         return len(self.doc)
 
     # --- markup creation ---
-    def _finish(self, a: fitz.Annot, color, width, subject, content="", fill=None, opacity=1.0):
+    def _finish(self, a, color, width, subject, fill=None, opacity=1.0, measure=None, content=""):
         a.set_colors(stroke=color, fill=fill)
         a.set_border(width=width)
         a.set_opacity(opacity)
-        a.set_info(title=TAG, subject=subject, content=content)
+        a.set_info(title=self.author, subject=subject, content=content)
         a.update()
+        if measure:
+            self.doc.xref_set_key(a.xref, MEASURE_KEY, f"({measure})")
         return a
 
-    def add_rect(self, pno, rect, color=(1, 0, 0), width=1.5, fill=None):
-        return self._finish(self.doc[pno].add_rect_annot(rect), color, width, "Rectangle", fill=fill)
+    @_mutates
+    def add_rect(self, pno, rect, color=(1, 0, 0), width=1.5, fill=None, opacity=1.0):
+        return self._finish(self.doc[pno].add_rect_annot(rect), color, width, "Rectangle", fill=fill, opacity=opacity)
 
-    def add_ellipse(self, pno, rect, color=(1, 0, 0), width=1.5):
-        return self._finish(self.doc[pno].add_circle_annot(rect), color, width, "Ellipse")
+    @_mutates
+    def add_ellipse(self, pno, rect, color=(1, 0, 0), width=1.5, fill=None, opacity=1.0):
+        return self._finish(self.doc[pno].add_circle_annot(rect), color, width, "Ellipse", fill=fill, opacity=opacity)
 
+    @_mutates
     def add_line(self, pno, p1, p2, color=(1, 0, 0), width=1.5, arrow=False):
         a = self.doc[pno].add_line_annot(p1, p2)
         if arrow:
             a.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_CLOSED_ARROW)
         return self._finish(a, color, width, "Arrow" if arrow else "Line")
 
+    @_mutates
+    def add_polyline(self, pno, pts, color=(1, 0, 0), width=1.5):
+        return self._finish(self.doc[pno].add_polyline_annot(pts), color, width, "Polyline")
+
+    @_mutates
+    def add_polygon(self, pno, pts, color=(1, 0, 0), width=1.5, fill=None, opacity=1.0):
+        return self._finish(self.doc[pno].add_polygon_annot(pts), color, width, "Polygon", fill=fill, opacity=opacity)
+
+    @_mutates
     def add_freehand(self, pno, pts, color=(1, 0, 0), width=2):
-        a = self.doc[pno].add_ink_annot([list(pts)])
-        return self._finish(a, color, width, "Pen")
+        return self._finish(self.doc[pno].add_ink_annot([list(pts)]), color, width, "Pen")
 
+    @_mutates
     def add_cloud(self, pno, rect, color=(1, 0, 0), width=1.5):
-        a = self.doc[pno].add_polyline_annot(cloud_points(rect))
-        return self._finish(a, color, width, "Cloud")
+        return self._finish(self.doc[pno].add_polyline_annot(cloud_points(rect)), color, width, "Cloud")
 
-    def add_highlight(self, pno, rect, color=(1, 1, 0)):
+    def _markup_text(self, pno, rect, kind, color):
         page = self.doc[pno]
         words = [w for w in page.get_text("words") if fitz.Rect(w[:4]).intersects(rect)]
-        a = page.add_highlight_annot(quads=[fitz.Rect(w[:4]).quad for w in words]) if words \
-            else page.add_highlight_annot(rect)
+        quads = [fitz.Rect(w[:4]).quad for w in words] or [fitz.Rect(rect).quad]
+        a = getattr(page, f"add_{kind}_annot")(quads=quads)
         a.set_colors(stroke=color)
-        a.set_info(title=TAG, subject="Highlight")
+        a.set_info(title=self.author, subject=kind.title())
         a.update()
         return a
 
-    def add_text(self, pno, rect, text, color=(1, 0, 0), fontsize=12):
-        a = self.doc[pno].add_freetext_annot(rect, text, fontsize=fontsize, text_color=color,
-                                              fill_color=(1, 1, 1))
-        a.set_info(title=TAG, subject="Text")
+    @_mutates
+    def add_highlight(self, pno, rect, color=(1, 1, 0)):
+        return self._markup_text(pno, rect, "highlight", color)
+
+    @_mutates
+    def add_underline(self, pno, rect, color=(0, 0.6, 0)):
+        return self._markup_text(pno, rect, "underline", color)
+
+    @_mutates
+    def add_strikeout(self, pno, rect, color=(1, 0, 0)):
+        return self._markup_text(pno, rect, "strikeout", color)
+
+    @_mutates
+    def add_squiggly(self, pno, rect, color=(1, 0, 0)):
+        return self._markup_text(pno, rect, "squiggly", color)
+
+    @_mutates
+    def add_text(self, pno, rect, text, color=(1, 0, 0), fontsize=12, fill=(1, 1, 1)):
+        a = self.doc[pno].add_freetext_annot(rect, text, fontsize=fontsize, text_color=color, fill_color=fill)
+        a.set_info(title=self.author, subject="Text")
         a.update()
         return a
 
+    @_mutates
+    def add_callout(self, pno, rect, text, tip, color=(1, 0, 0), fontsize=11):
+        """Text box with a leader line to `tip` (a callout)."""
+        a = self.doc[pno].add_freetext_annot(rect, text, fontsize=fontsize, text_color=color, fill_color=(1, 1, 1))
+        a.set_info(title=self.author, subject="Callout")
+        a.update()
+        r = fitz.Rect(rect)
+        c = fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+        self.add_line(pno, c, tip, color, 1.0, arrow=True)
+        return a
+
+    @_mutates
     def add_note(self, pno, point, text):
         a = self.doc[pno].add_text_annot(point, text)
-        a.set_info(title=TAG, subject="Note", content=text)
+        a.set_info(title=self.author, subject="Note", content=text)
+        a.update()
+        return a
+
+    @_mutates
+    def add_reply(self, markup: Markup, text):
+        pg = markup._page
+        r = markup.annot.rect
+        a = pg.add_text_annot((r.x1, r.y0), text)
+        a.set_info(title=self.author, subject="Reply", content=text)
+        a.update()
+        self.doc.xref_set_key(a.xref, "IRT", f"{markup.xref} 0 R")
+        return a
+
+    @_mutates
+    def add_stamp(self, pno, rect, text="APPROVED", color=(0, 0.5, 0), date=True):
+        """Custom text stamp rendered to an image (name + date line like Revu dynamic stamps)."""
+        r = fitz.Rect(rect)
+        lines = [text] + ([f"{self.author}  {_today()}"] if date else [])
+        src = fitz.open()
+        w, h = 400, 120 if date else 80
+        sp = src.new_page(width=w, height=h)
+        sp.draw_rect(fitz.Rect(3, 3, w - 3, h - 3), color=color, width=4)
+        sp.insert_textbox(fitz.Rect(8, 6, w - 8, h * (0.62 if date else 1)), lines[0],
+                          fontsize=38 if date else 40, fontname="hebo", color=color, align=1)
+        if date:
+            sp.insert_textbox(fitz.Rect(8, h * 0.66, w - 8, h - 4), lines[1], fontsize=18, color=color, align=1)
+        a = self.doc[pno].add_stamp_annot(r, stamp=sp.get_pixmap(dpi=144))
+        a.set_info(title=self.author, subject="Stamp", content=text)
+        a.update()
+        return a
+
+    @_mutates
+    def add_image_stamp(self, pno, rect, image_path, subject="Image"):
+        a = self.doc[pno].add_stamp_annot(rect, stamp=image_path)
+        a.set_info(title=self.author, subject=subject)
+        a.update()
+        return a
+
+    @_mutates
+    def add_from_dict(self, pno, d, offset=(0, 0)):
+        """Recreate a markup from Markup.to_dict() at an offset (paste / tool chest)."""
+        dx, dy = offset
+        k, page = d["kind"], self.doc[pno]
+        col = tuple(d["stroke"]) if d.get("stroke") else None
+        fill = tuple(d["fill"]) if d.get("fill") else None
+        r = fitz.Rect(d["rect"]) + (dx, dy, dx, dy)
+        sh = lambda pts: [(p[0] + dx, p[1] + dy) for p in pts]  # noqa: E731
+        if k == "Square":
+            a = page.add_rect_annot(r)
+        elif k == "Circle":
+            a = page.add_circle_annot(r)
+        elif k == "Line":
+            a = page.add_line_annot(*sh(d["vertices"]))
+            if d.get("arrow"):
+                a.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_CLOSED_ARROW)
+        elif k == "PolyLine":
+            a = page.add_polyline_annot(sh(d["vertices"]))
+        elif k == "Polygon":
+            a = page.add_polygon_annot(sh(d["vertices"]))
+        elif k == "Ink":
+            a = page.add_ink_annot([sh(s) for s in d["vertices"]])
+        elif k == "FreeText":
+            a = page.add_freetext_annot(r, d["comment"], fontsize=12, text_color=col or (1, 0, 0), fill_color=fill or (1, 1, 1))
+        elif k == "Text":
+            a = page.add_text_annot(r.tl, d["comment"])
+        else:
+            raise ValueError(f"cannot recreate {k} markups")
+        if k not in ("FreeText", "Text"):
+            a.set_colors(stroke=col, fill=fill)
+            a.set_border(width=d.get("width", 1))
+            a.set_opacity(d.get("opacity", 1))
+        a.set_info(title=self.author, subject=d.get("subject", ""), content=d.get("comment", ""))
         a.update()
         return a
 
     # --- measurements (takeoff) ---
-    def add_length(self, pno, pts, color=(0, 0.4, 1), label=True):
-        v = self.scale.length(pts)
-        a = self.doc[pno].add_polyline_annot(pts) if len(pts) > 2 else self.doc[pno].add_line_annot(*pts)
-        self._finish(a, color, 1.5, "Length", f"{TAG}:length:{v:.6f}:{self.scale.unit}")
-        if label:
-            self._label(pno, pts[len(pts) // 2], f"{v:.2f} {self.scale.unit}", color)
-        return a, v
-
-    def add_area(self, pno, pts, color=(0, 0.6, 0.2), label=True):
-        v = self.scale.area(pts)
-        a = self.doc[pno].add_polygon_annot(pts)
-        self._finish(a, color, 1.5, "Area", f"{TAG}:area:{v:.6f}:{self.scale.unit}", fill=color, opacity=0.25)
-        if label:
-            c = fitz.Point(sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
-            self._label(pno, c, f"{v:.2f} {self.scale.unit}²", color)
-        return a, v
-
-    def add_count(self, pno, point, color=(0.8, 0, 0.8)):
-        r = fitz.Rect(point[0] - 5, point[1] - 5, point[0] + 5, point[1] + 5)
-        a = self.doc[pno].add_circle_annot(r)
-        self._finish(a, color, 1.5, "Count", f"{TAG}:count:1:ea", fill=color)
-        return a
-
-    def _label(self, pno, center, text, color):
-        w = 7 * len(text) + 6
+    def _label(self, pno, center, text, color, parent):
+        w = 6.2 * len(text) + 8
         r = fitz.Rect(center[0] - w / 2, center[1] - 8, center[0] + w / 2, center[1] + 8)
         a = self.doc[pno].add_freetext_annot(r, text, fontsize=10, text_color=color, fill_color=(1, 1, 1))
-        a.set_info(title=TAG, subject="Label")
+        a.set_info(title=self.author, subject="Label")
         a.update()
+        self.doc.xref_set_key(a.xref, PARENT_KEY, str(parent.xref))
+
+    @staticmethod
+    def _centroid(pts):
+        return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+
+    @_mutates
+    def add_length(self, pno, pts, color=(0, 0.4, 1), label=True, subject="Length"):
+        pts = [tuple(p) for p in pts]
+        sc = self.scale_for(pno)
+        v = sc.length(pts)
+        pg = self.doc[pno]
+        a = pg.add_polyline_annot(pts) if len(pts) > 2 else pg.add_line_annot(*pts)
+        self._finish(a, color, 1.5, subject, measure=f"length:{v:.6f}:{sc.unit}")
+        if label:
+            mid = pts[len(pts) // 2] if len(pts) > 2 else self._centroid(pts)
+            self._label(pno, mid, f"{v:.2f} {sc.unit}", color, a)
+        return a, v
+
+    @_mutates
+    def add_perimeter(self, pno, pts, color=(0, 0.4, 1), label=True, subject="Perimeter"):
+        pts = [tuple(p) for p in pts]
+        sc = self.scale_for(pno)
+        v = sc.length(pts + pts[:1])
+        a = self.doc[pno].add_polygon_annot(pts)
+        self._finish(a, color, 1.5, subject, measure=f"perimeter:{v:.6f}:{sc.unit}")
+        if label:
+            self._label(pno, self._centroid(pts), f"{v:.2f} {sc.unit}", color, a)
+        return a, v
+
+    @_mutates
+    def add_area(self, pno, pts, color=(0, 0.6, 0.2), label=True, subject="Area", cutouts=(), depth=None):
+        """Polygon area minus cutouts. If depth is given (real units) a volume is recorded instead."""
+        pts = [tuple(p) for p in pts]
+        sc = self.scale_for(pno)
+        v = sc.area(pts) - sum(sc.area(c) for c in cutouts)
+        if v < 0:
+            raise ValueError("cutouts exceed the area")
+        kind, unit, txt = "area", sc.unit, f"{v:.2f} {sc.unit}²"
+        if depth is not None:
+            if depth <= 0:
+                raise ValueError("depth must be positive")
+            v, kind, txt = v * depth, "volume", f"{v * depth:.2f} {sc.unit}³"
+        a = self.doc[pno].add_polygon_annot(pts)
+        self._finish(a, color, 1.5, subject, fill=color, opacity=0.25, measure=f"{kind}:{v:.6f}:{unit}")
+        for c in cutouts:
+            ca = self.doc[pno].add_polygon_annot([tuple(p) for p in c])
+            self._finish(ca, (0.5, 0.5, 0.5), 1, "Cutout", fill=(1, 1, 1), opacity=0.8)
+            self.doc.xref_set_key(ca.xref, PARENT_KEY, str(a.xref))
+        if label:
+            self._label(pno, self._centroid(pts), txt, color, a)
+        return a, v
+
+    @_mutates
+    def add_rect_area(self, pno, rect, **kw):
+        r = fitz.Rect(rect).normalize()
+        return self.add_area(pno, [tuple(r.tl), tuple(r.tr), tuple(r.br), tuple(r.bl)], **kw)
+
+    @_mutates
+    def add_ellipse_area(self, pno, rect, color=(0, 0.6, 0.2), label=True, subject="Area"):
+        r = fitz.Rect(rect).normalize()
+        sc = self.scale_for(pno)
+        v = math.pi * (r.width / 2) * (r.height / 2) * sc.unit_per_pt ** 2
+        a = self.doc[pno].add_circle_annot(r)
+        self._finish(a, color, 1.5, subject, fill=color, opacity=0.25, measure=f"area:{v:.6f}:{sc.unit}")
+        if label:
+            self._label(pno, self._centroid([tuple(r.tl), tuple(r.br)]), f"{v:.2f} {sc.unit}²", color, a)
+        return a, v
+
+    @_mutates
+    def add_diameter(self, pno, p1, p2, color=(0, 0.4, 1), label=True, subject="Diameter"):
+        """Circle through the diameter p1-p2; records the diameter length."""
+        c = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+        rad = math.dist(p1, p2) / 2
+        sc = self.scale_for(pno)
+        v = math.dist(p1, p2) * sc.unit_per_pt
+        a = self.doc[pno].add_circle_annot(fitz.Rect(c[0] - rad, c[1] - rad, c[0] + rad, c[1] + rad))
+        self._finish(a, color, 1.5, subject, measure=f"diameter:{v:.6f}:{sc.unit}")
+        if label:
+            self._label(pno, c, f"Ø {v:.2f} {sc.unit}", color, a)
+        return a, v
+
+    @_mutates
+    def add_angle(self, pno, a_, b_, c_, color=(0, 0.4, 1), label=True, subject="Angle"):
+        deg = angle_deg(a_, b_, c_)
+        a = self.doc[pno].add_polyline_annot([a_, b_, c_])
+        self._finish(a, color, 1.5, subject, measure=f"angle:{deg:.6f}:deg")
+        if label:
+            self._label(pno, b_, f"{deg:.1f}°", color, a)
+        return a, deg
+
+    @_mutates
+    def add_count(self, pno, point, color=(0.8, 0, 0.8), group="Count"):
+        r = fitz.Rect(point[0] - 5, point[1] - 5, point[0] + 5, point[1] + 5)
+        a = self.doc[pno].add_circle_annot(r)
+        self._finish(a, color, 1.5, group, fill=color, measure="count:1:ea")
+        return a
 
     # --- querying / editing ---
-    def markups(self):
+    def markups(self, include_children=False):
         out = []
         for pno, page in enumerate(self.doc):
             for a in page.annots() or []:
-                out.append(Markup(a, pno, page))
+                if a.type[1] in ("Popup", "Link", "Widget"):
+                    continue
+                if not include_children and (_xget(self.doc, a.xref, PARENT_KEY) or _xget(self.doc, a.xref, "IRT")):
+                    continue
+                out.append(Markup(a, pno, page, self))
         return out
 
+    def markup_at(self, pno, point, tol=4):
+        """Topmost markup on page whose bounds contain the point (for selection)."""
+        pt = fitz.Point(point)
+        hits = [m for m in self.markups() if m.page_no == pno and (m.rect + (-tol, -tol, tol, tol)).contains(pt)]
+        return hits[-1] if hits else None
+
+    @_mutates
     def delete(self, markup: Markup):
-        self.doc[markup.page_no].delete_annot(markup.annot)
+        for c in markup._children():
+            markup._page.delete_annot(c)
+        for a in markup._page.annots() or []:
+            if _xget(self.doc, a.xref, "IRT") == f"{markup.xref} 0 R":
+                markup._page.delete_annot(a)
+        markup._page.delete_annot(markup.annot)
 
     def takeoff(self):
-        """Aggregate measurements: {(kind, unit): total}."""
+        """{(kind, unit): total} over all measurement markups."""
         totals: dict = {}
         for m in self.markups():
             r = m.measurement()
             if r:
-                kind, val, unit = r
-                totals[(kind, unit)] = totals.get((kind, unit), 0.0) + val
+                totals[(r[0], r[2])] = totals.get((r[0], r[2]), 0.0) + r[1]
         return totals
+
+    def takeoff_by_subject(self):
+        """{(subject, kind, unit): (count_of_items, total)} — a measurement summary."""
+        out: dict = {}
+        for m in self.markups():
+            r = m.measurement()
+            if r:
+                n, t = out.get((m.subject, r[0], r[2]), (0, 0.0))
+                out[(m.subject, r[0], r[2])] = (n + 1, t + r[1])
+        return out
 
     def export_csv(self, path):
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["page", "type", "subject", "comment", "value", "unit"])
+            w.writerow(["page", "type", "subject", "author", "status", "comment", "replies", "measure", "value", "unit"])
             for m in self.markups():
                 r = m.measurement()
-                w.writerow([m.page_no + 1, m.kind, m.subject, "" if r else m.comment,
-                            f"{r[1]:.4f}" if r else "", r[2] if r else ""])
+                w.writerow([m.page_no + 1, m.kind, m.subject, m.author, m.status, m.comment,
+                            " | ".join(f"{a}: {t}" for a, t in m.replies()),
+                            r[0] if r else "", f"{r[1]:.4f}" if r else "", r[2] if r else ""])
 
-    def render(self, pno, zoom=1.0) -> fitz.Pixmap:
-        return self.doc[pno].get_pixmap(matrix=fitz.Matrix(zoom, zoom), annots=True)
+    def export_summary_csv(self, path):
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["subject", "measure", "items", "total", "unit"])
+            for (s, k, u), (n, t) in sorted(self.takeoff_by_subject().items()):
+                w.writerow([s, k, n, f"{t:.4f}", u])
 
-    def save(self, path=None):
-        self._store_scale()
+    def render(self, pno, zoom=1.0, clip=None) -> fitz.Pixmap:
+        return self.doc[pno].get_pixmap(matrix=fitz.Matrix(zoom, zoom), annots=True, clip=clip)
+
+    def save(self, path=None, **opts):
+        self._store_scales()
         path = path or self.path
         if path is None:
             raise ValueError("no path")
+        kw = {"garbage": 3, "deflate": True, **opts}
         if path == self.path:
-            # PyMuPDF cannot overwrite the open file with a full save; write aside and swap.
             tmp = path + ".tmp"
-            self.doc.save(tmp, garbage=3, deflate=True)
+            self.doc.save(tmp, **kw)
             self.doc.close()
             os.replace(tmp, path)
             self.doc = fitz.open(path)
+            if opts.get("encryption", None) is None and self.doc.needs_pass:
+                raise PermissionError("saved file is encrypted; reopen with password")
         else:
-            self.doc.save(path, garbage=3, deflate=True)
+            self.doc.save(path, **kw)
             self.path = path
+        self.modified = False
+
+
+def _today() -> str:
+    import datetime
+    return datetime.date.today().isoformat()
+

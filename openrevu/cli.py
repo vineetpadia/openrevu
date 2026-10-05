@@ -1,0 +1,80 @@
+"""Batch / headless command line: openrevu-cli <command> ..."""
+from __future__ import annotations
+
+import argparse
+import sys
+
+from .core import Document
+from .pages import compare_pdfs
+
+
+def _doc(a):
+    return Document(a.input, getattr(a, "password", None))
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="openrevu-cli", description="Batch PDF operations")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, help_, *args):
+        sp = sub.add_parser(name, help=help_)
+        sp.add_argument("input")
+        for a in args:
+            sp.add_argument(*a[0], **a[1])
+        return sp
+
+    out = (("output",), {})
+    add("merge", "merge PDFs", out).add_argument("more", nargs="+")
+    add("split", "split into N-page files", (("output",), {}), (("--every",), {"type": int, "default": 1}))
+    add("watermark", "text watermark", out, (("--text",), {"required": True}))
+    add("flatten", "bake annotations into page content", out)
+    add("optimize", "compress", out)
+    add("redact", "permanently redact text matches", out, (("--text",), {"required": True}))
+    add("ocr", "add text layer (needs tesseract)", out, (("--lang",), {"default": "eng"}))
+    add("encrypt", "AES-256 password", out, (("--password",), {"required": True}))
+    add("csv", "export markups CSV", (("output",), {}))
+    add("summary", "export measurement summary CSV", (("output",), {}))
+    add("compare", "overlay compare two PDFs", (("new",), {}), out)
+    add("numbering", "Bates numbering", out, (("--prefix",), {"default": ""}), (("--start",), {"type": int, "default": 1}))
+    add("footer", "page x of y footer", out)
+    a = p.parse_args(argv)
+    try:
+        if a.cmd == "compare":
+            for i, f in enumerate(compare_pdfs(a.input, a.new, a.output)):
+                print(f"page {i + 1}: {f:.2%} changed")
+            return 0
+        d = _doc(a)
+        if a.cmd == "merge":
+            for m in a.more:
+                d.insert_pdf(m)
+            d.save(a.output)
+        elif a.cmd == "split":
+            print("\n".join(d.split(a.output, every=a.every)))
+        elif a.cmd == "watermark":
+            d.watermark(a.text); d.save(a.output)
+        elif a.cmd == "flatten":
+            d.flatten(); d.save(a.output)
+        elif a.cmd == "optimize":
+            print("%d -> %d bytes" % d.optimize(a.output))
+        elif a.cmd == "redact":
+            n = d.mark_redaction_text(a.text); d.apply_redactions(); d.save(a.output); print(f"{n} redactions")
+        elif a.cmd == "ocr":
+            print(f"{d.ocr(a.lang)} pages OCRed"); d.save(a.output)
+        elif a.cmd == "encrypt":
+            d.save_encrypted(a.output, a.password)
+        elif a.cmd == "csv":
+            d.export_csv(a.output)
+        elif a.cmd == "summary":
+            d.export_summary_csv(a.output)
+        elif a.cmd == "numbering":
+            d.bates(a.prefix, a.start); d.save(a.output)
+        elif a.cmd == "footer":
+            d.header_footer(footer=("", "Page {page} of {pages}", "")); d.save(a.output)
+    except (RuntimeError, OSError, ValueError, PermissionError, IndexError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
