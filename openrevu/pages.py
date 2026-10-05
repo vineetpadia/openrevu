@@ -514,42 +514,7 @@ class PageOps:
 
 
 def compare_pdfs(old_path, new_path, out_path, dpi=100):
-    """Overlay comparison: pixels only in old = red, only in new = blue, shared = grey.
-    Returns [changed_fraction per page]; writes a PDF of the overlays."""
-    from .core import Document
-    a, b = Document._open(old_path), Document._open(new_path)
-    out, stats = fitz.open(), []
-    for i in range(max(len(a), len(b))):
-        pa = a[i].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY) if i < len(a) else None
-        pb = b[i].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY) if i < len(b) else None
-        w = max(p.width for p in (pa, pb) if p)
-        h = max(p.height for p in (pa, pb) if p)
-
-        def grid(p):
-            g = bytearray(b"\xff" * (w * h))
-            if p:
-                for y in range(p.height):
-                    g[y * w:y * w + p.width] = p.samples[y * p.width:(y + 1) * p.width]
-            return g
-
-        ga, gb = grid(pa), grid(pb)
-        rgb = bytearray(w * h * 3)
-        changed = 0
-        for k in range(w * h):
-            da, db = ga[k] < 128, gb[k] < 128
-            if da and db:
-                c = (110, 110, 110)
-            elif da:
-                c, changed = (230, 40, 40), changed + 1
-            elif db:
-                c, changed = (40, 80, 230), changed + 1
-            else:
-                c = (255, 255, 255)
-            rgb[3 * k:3 * k + 3] = bytes(c)
-        pix = fitz.Pixmap(fitz.csRGB, w, h, bytes(rgb), False)
-        pg = out.new_page(width=w * 72 / dpi, height=h * 72 / dpi)
-        pg.insert_image(pg.rect, pixmap=pix)
-        stats.append(changed / (w * h))
-    out.save(out_path, garbage=3, deflate=True)
-    a.close(); b.close()
-    return stats
+    """Overlay comparison by page position. Returns the share of each page's area that differs.
+    (For sheet matching, tolerance, and text differences use openrevu.compare.compare_documents.)"""
+    from .compare import compare_documents
+    return [r.area_fraction for r in compare_documents(old_path, new_path, out_path, match="page", dpi=dpi, tolerance=0)]

@@ -35,7 +35,7 @@ def main(argv=None) -> int:
     add("encrypt", "AES-256 password", out, (("--password",), {"required": True}))
     add("csv", "export markups CSV", (("output",), {}))
     add("summary", "export measurement summary CSV", (("output",), {}))
-    add("compare", "overlay compare two PDFs", (("new",), {}), out)
+    add("compare", "compare two PDFs (overlay PDF, text changes)", (("new",), {}), out, (("--match",), {"default": "sheet", "choices": ["sheet", "page"]}), (("--csv",), {"default": None}), (("--new-password",), {"default": None}))
     add("numbering", "Bates numbering", out, (("--prefix",), {"default": ""}), (("--start",), {"type": int, "default": 1}))
     add("run", "run a Python script with `doc` (an openrevu Document) preloaded; saves to output", out) \
         .add_argument("script")
@@ -45,10 +45,14 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     try:
         if a.cmd == "compare":
-            if a.in_password:
-                raise ValueError("compare does not support encrypted inputs")
-            for i, f in enumerate(compare_pdfs(a.input, a.new, a.output)):
-                print(f"page {i + 1}: {f:.2%} changed")
+            from .compare import compare_documents, summarize, write_csv
+            res = compare_documents(a.input, a.new, a.output, match=a.match, old_password=a.in_password, new_password=a.new_password)
+            for r in res:
+                extra = f", {r.changed_fraction:.1%} of the drawing, +{r.words_added}/-{r.words_removed} words" if r.status == "changed" else ""
+                print(f"{r.number}: {r.status}{extra}")
+            print(summarize(res))
+            if a.csv:
+                write_csv(res, a.csv)
             return 0
         d = _doc(a)
         if a.cmd == "merge":

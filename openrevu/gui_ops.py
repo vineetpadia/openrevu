@@ -243,21 +243,111 @@ class DocumentOps:
                           keywords=";".join(([kw] if kw and "OpenRevu-scale" not in kw else []) + hidden))
 
     def compare(self):
+        """Compare the open document (old) with another PDF (new)."""
         if not self._need_doc():
             return
-        if not self.doc.path:
-            return W.QMessageBox.information(self, "Compare", "Save the document first.")
-        other, _ = W.QFileDialog.getOpenFileName(self, "Compare with (new version)", "", "PDF (*.pdf)")
+        if not self.doc.path or self.doc.modified:
+            return W.QMessageBox.information(self, "Compare", "Save the document first. The comparison uses the saved file.")
+        other, _ = W.QFileDialog.getOpenFileName(self, "Compare with (the new version)", "", "PDF (*.pdf)")
         if not other:
             return
-        out, _ = W.QFileDialog.getSaveFileName(self, "Save comparison as", "comparison.pdf", "PDF (*.pdf)")
-        if out:
-            try:
-                stats = compare_pdfs(self.doc.path, other, out)
-            except ERRORS as e:
-                return W.QMessageBox.warning(self, "Compare", str(e))
-            self.open(out)
-            self.statusBar().showMessage("Changed: " + ", ".join(f"p{i + 1} {s:.1%}" for i, s in enumerate(stats) if s))
+        mode, ok = W.QInputDialog.getItem(self, "Compare", "Pair the pages:", ["By sheet number", "By page position"], 0, False)
+        if not ok:
+            return
+        out, _ = W.QFileDialog.getSaveFileName(self, "Save the overlay as", "comparison.pdf", "PDF (*.pdf)")
+        if not out:
+            return
+        from .compare import compare_documents
+        W.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            res = compare_documents(self.doc.path, other, out, match="sheet" if mode.startswith("By sheet") else "page",
+                                    old_password=getattr(self.doc, "_password", None))
+        except ERRORS as e:
+            W.QApplication.restoreOverrideCursor()
+            return W.QMessageBox.warning(self, "Compare", str(e))
+        W.QApplication.restoreOverrideCursor()
+        self.build_compare_dialog(res, out).exec_()
+
+    def build_compare_dialog(self, results, overlay_path):
+        from .compare import summarize, write_csv
+        dlg = W.QDialog(self)
+        dlg.setWindowTitle("Comparison")
+        dlg.resize(780, 420)
+        lay = W.QVBoxLayout(dlg)
+        lay.addWidget(W.QLabel(f"<b>{summarize(results)}</b><br>Red = only in the old version. Blue = only in the new version."))
+        t = W.QTableWidget(len(results), 5, editTriggers=W.QAbstractItemView.NoEditTriggers)
+        t.setHorizontalHeaderLabels(["Sheet", "Status", "Drawing changed", "Words +/-", "Text changes"])
+        t.horizontalHeader().setStretchLastSection(True)
+        t.verticalHeader().hide()
+        for r, c in enumerate(results):
+            vals = [c.number, c.status + (" (page size differs)" if c.size_changed else ""),
+                    f"{c.changed_fraction:.1%}" if c.status == "changed" else "",
+                    f"+{c.words_added} / -{c.words_removed}" if c.status == "changed" else "", " | ".join(c.text_changes)]
+            for k, v in enumerate(vals):
+                t.setItem(r, k, W.QTableWidgetItem(v))
+        lay.addWidget(t)
+        row = W.QHBoxLayout()
+        b1, b2, b3 = W.QPushButton("Open overlay"), W.QPushButton("Save report (CSV)…"), W.QPushButton("Close")
+        for b in (b1, b2, b3):
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        def save_csv():
+            p, _ = W.QFileDialog.getSaveFileName(self, "Save report", "comparison.csv", "CSV (*.csv)")
+            if p:
+                write_csv(results, p)
+
+        b1.clicked.connect(lambda: (self.open(overlay_path), dlg.accept()))
+        b2.clicked.connect(save_csv)
+        b3.clicked.connect(dlg.accept)
+        dlg.results_table = t
+        return dlg
+
+    # ---------- sheets ----------
+    def detect_sheets(self):
+        if self._need_doc():
+            n = self._run(self.doc.detect_sheets)
+            if n is not None:
+                self.refresh_sheets()
+                self.statusBar().showMessage(f"{n} sheet number(s) detected." if n else "No new sheet numbers found.")
+
+    def add_revision_dialog(self):
+        if not self._need_doc():
+            return
+        rows = self.sheets_selected_pages()
+        if not rows:
+            return self.statusBar().showMessage("Select a sheet in the Sheets panel first.")
+        v = self._form_dialog("Add revision", [("Revision", ""), ("Description", ""), ("Date (YYYY-MM-DD, blank = today)", "")])
+        if not v:
+            return
+        for pno in rows:
+            if not self._run(self.doc.add_revision, pno, v["Revision"], v["Description"], v["Date (YYYY-MM-DD, blank = today)"].strip() or None):
+                break
+        self.refresh_sheets()
+
+    def insert_index_page(self):
+        if self._need_doc():
+            n = self._run(self.doc.insert_sheet_index, 0, structural=True)
+            if n:
+                self.refresh_thumbs(); self.refresh_toc(); self.refresh_sheets()
+                self.statusBar().showMessage(f"Sheet index inserted ({n} page(s)).")
+
+    def slip_sheet_dialog(self):
+        if not self._need_doc():
+            return
+        p, _ = W.QFileDialog.getOpenFileName(self, "New version of the sheets", "", "PDF (*.pdf)")
+        if not p:
+            return
+        mode, ok = W.QInputDialog.getItem(self, "Slip sheet", "Pair the pages:", ["By sheet number", "By page position"], 0, False)
+        if not ok:
+            return
+        rev, ok = W.QInputDialog.getText(self, "Slip sheet", "Revision name to record (optional):")
+        if not ok:
+            return
+        rep = self._run(self.doc.slip_sheet, p, "number" if mode.startswith("By sheet") else "page", True, rev.strip() or None, structural=True)
+        if rep not in (None, True):
+            self.refresh_thumbs(); self.refresh_toc(); self.refresh_sheets()
+            W.QMessageBox.information(self, "Slip sheet", rep.summary())
 
     def fill_form(self):
         if not self._need_doc():

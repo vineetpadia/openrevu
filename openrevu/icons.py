@@ -32,7 +32,7 @@ FILES = {
     "duplicate": "copy-plus", "bookmark": "bookmark", "thumbnails": "gallery-thumbnails", "layers": "layers",
     "properties": "sliders-horizontal", "toolchest": "wrench", "measure": "ruler", "images": "images",
     "add": "plus", "close": "x", "keep": "pin", "reply": "reply", "auto": "wand-sparkles", "line-colour": "pen-line",
-    "fill-colour": "paint-bucket",
+    "fill-colour": "paint-bucket", "sheets": "file-stack",
 }
 MEASURE_TOOLS = {"Calibrate", "Length", "Perimeter", "Area", "Fill", "RectArea", "EllipseArea", "Volume",
                  "Diameter", "Angle", "Count", "Viewport"}

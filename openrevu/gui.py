@@ -313,6 +313,33 @@ class Main(DocumentOps, W.QMainWindow):
         ll.addWidget(W.QLabel("Tick a layer to show it."))
         ll.addWidget(self.layer_list)
         self._add_panel(self.left_tabs, lw, "Layers", "layers")
+        shw = W.QWidget()
+        shl = W.QVBoxLayout(shw)
+        self.sheets_table = W.QTableWidget(0, 5)
+        self.sheets_table.setHorizontalHeaderLabels(["Page", "Sheet", "Title", "Discipline", "Rev"])
+        self.sheets_table.verticalHeader().hide()
+        self.sheets_table.horizontalHeader().setStretchLastSection(True)
+        self.sheets_table.setSelectionBehavior(W.QAbstractItemView.SelectRows)
+        self.sheets_table.setSelectionMode(W.QAbstractItemView.ExtendedSelection)
+        self.sheets_table.setToolTip("Double-click Sheet, Title, or Discipline to edit. Click a row to go to the page.")
+        self.sheets_table.itemChanged.connect(self._sheet_edited)
+        self.sheets_table.itemSelectionChanged.connect(self._sheet_selected)
+        shl.addWidget(self.sheets_table)
+        srow = W.QHBoxLayout()
+        for text, icon, tip, fn in (("Detect", "auto", "Find the sheet numbers and titles", self.detect_sheets),
+                                    ("Revision", "add", "Add a revision to the selected sheets", self.add_revision_dialog),
+                                    ("Index", "sheets", "Insert a sheet index page with links", self.insert_index_page),
+                                    ("Slip", "open", "Replace sheets with a new version and keep the markups", self.slip_sheet_dialog)):
+            b = W.QPushButton(tool_icon(icon, 18), text)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            srow.addWidget(b)
+        shl.addLayout(srow)
+        bexp = W.QPushButton("Export sheet list (CSV)…")
+        bexp.clicked.connect(self.export_sheet_csv)
+        shl.addWidget(bexp)
+        self._add_panel(self.left_tabs, shw, "Sheets", "sheets")
+        self.left_tabs.currentChanged.connect(lambda _i: self.refresh_sheets())
         self.left_dock = self._dock("Panels", self.left_tabs, QtCore.Qt.LeftDockWidgetArea)
 
         # ---- right: Properties, Tool Chest, Measurements
@@ -973,6 +1000,7 @@ class Main(DocumentOps, W.QMainWindow):
         self.refresh_all()
 
     def _after_change(self):
+        self.refresh_sheets()
         self.refresh_markups()
         self._load_props()
         self._update_status_widgets()
@@ -988,6 +1016,7 @@ class Main(DocumentOps, W.QMainWindow):
         self.refresh_thumbs()
         self.refresh_toc()
         self.refresh_layers()
+        self.refresh_sheets()
         self._load_props()
         self._update_status_widgets()
         d = self.doc
@@ -1098,6 +1127,53 @@ class Main(DocumentOps, W.QMainWindow):
             it.setData(QtCore.Qt.UserRole, l["number"])
             self.layer_list.addItem(it)
         self.layer_list.blockSignals(False)
+
+    def refresh_sheets(self):
+        """Fill the Sheets table. This reads text from every page, so it runs only while the panel is visible."""
+        if self.panel_name(self.left_tabs, self.left_tabs.currentIndex()) != "Sheets" or self.left_dock.isHidden():
+            return
+        t = self.sheets_table
+        keep = set(self.sheets_selected_pages())
+        t.blockSignals(True)
+        t.setRowCount(0)
+        d = self.doc
+        for r in (d.sheet_table() if d else []):
+            i = t.rowCount()
+            t.insertRow(i)
+            info = d.sheet_info(r["page"] - 1, detect=False)
+            vals = [str(r["page"]), r["number"], r["title"], r["discipline"], r["revision"]]
+            for c, v in enumerate(vals):
+                it = W.QTableWidgetItem(v)
+                if c in (0, 4):
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                if c == 4 and info["revisions"]:
+                    it.setToolTip("\n".join(f"{x['rev']}  {x['date']}  {x['description']}" for x in info["revisions"]))
+                t.setItem(i, c, it)
+            if r["page"] - 1 in keep:  # selectRow would drop the earlier rows, so add each row to the selection
+                t.selectionModel().select(t.model().index(i, 0), QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+        t.blockSignals(False)
+
+    def sheets_selected_pages(self) -> list[int]:
+        return sorted({int(self.sheets_table.item(i.row(), 0).text()) - 1 for i in self.sheets_table.selectedIndexes()})
+
+    def _sheet_selected(self):
+        pages = self.sheets_selected_pages()
+        if pages and self.cv:
+            self.cv.goto_page(pages[0])
+
+    def _sheet_edited(self, item):
+        if not self.cv or item.column() not in (1, 2, 3):
+            return
+        pno = int(self.sheets_table.item(item.row(), 0).text()) - 1
+        field = ("number", "title", "discipline")[item.column() - 1]
+        self._run(self.doc.set_sheet, pno, **{field: item.text()})
+        self.refresh_sheets()              # also puts the old value back when the edit was rejected (a duplicate number)
+
+    def export_sheet_csv(self):
+        if self._need_doc():
+            p, _ = W.QFileDialog.getSaveFileName(self, "Export sheet list", "sheets.csv", "CSV (*.csv)")
+            if p:
+                self._run(self.doc.export_sheet_index_csv, p)
 
     def _layer_toggled(self, item):
         if self.cv and item.data(QtCore.Qt.UserRole) is not None:
