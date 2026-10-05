@@ -956,3 +956,17 @@ def test_cli_sheets(tmp_path):
     assert main(["sheets", sheets_pdf(tmp_path / "set.pdf"), out]) == 0
     d = Document(out)
     assert len(d.toc()) == 3 and len(d.links(0)) == 1
+
+
+def test_cli_run_script(pdf, tmp_path):
+    from openrevu.cli import main
+    script = tmp_path / "s.py"
+    script.write_text("doc.add_count(0, (10, 10), group='Door')\ndoc.add_count(1, (20, 20), group='Door')\ndoc.watermark('SCRIPTED')\n")
+    out = str(tmp_path / "o.pdf")
+    assert main(["run", pdf, out, str(script)]) == 0
+    r = Document(out)
+    assert r.takeoff()[("count", "ea")] == 2 and "SCRIPTED" in r.page_text(0)
+    (tmp_path / "bad.py").write_text("raise ValueError('boom')\n")
+    assert main(["run", pdf, out, str(tmp_path / "bad.py")]) == 1
+    (tmp_path / "syn.py").write_text("def (\n")
+    assert main(["run", pdf, out, str(tmp_path / "syn.py")]) == 1

@@ -34,7 +34,7 @@ OCR needs the `tesseract` binary on PATH (tested with 5.5); room fill needs `num
 ## Known gaps vs. Bluebeam Revu (be honest before depending on it)
 - **No real-time collaboration** (Studio Sessions / Projects) or cloud storage. This needs a server and is out of scope
   for a local app; share files and use the Markups List CSV / status / replies for review rounds.
-- No `.bpx`/`.bax` import (Tool Chest uses JSON). No PDF/A conversion and no macro scripting (use `openrevu-cli` or import `openrevu.core` from Python).
+- No `.bpx`/`.bax` import (Tool Chest uses JSON). No PDF/A conversion. Scripting is Python: `openrevu-cli run script.py in.pdf out.pdf` exposes `doc`, or import `openrevu.core`.
 - Sheet Manager is a lightweight version: it detects sheet numbers by pattern and builds bookmarks and links, but has no sheet-set database or revision tracking.
 - Overlay compare is pixel-based (no semantic/text diff) and slow on large sheets.
 - Dynamic Fill needs a closed boundary at the render resolution (gaps leak and are reported); it traces the room outline,

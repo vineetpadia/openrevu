@@ -37,6 +37,8 @@ def main(argv=None) -> int:
     add("summary", "export measurement summary CSV", (("output",), {}))
     add("compare", "overlay compare two PDFs", (("new",), {}), out)
     add("numbering", "Bates numbering", out, (("--prefix",), {"default": ""}), (("--start",), {"type": int, "default": 1}))
+    add("run", "run a Python script with `doc` (an openrevu Document) preloaded; saves to output", out) \
+        .add_argument("script")
     add("sheets", "auto-bookmark sheet numbers and link sheet references", out)
     add("footer", "page x of y footer", out)
     a = p.parse_args(argv)
@@ -72,11 +74,16 @@ def main(argv=None) -> int:
             d.export_summary_csv(a.output)
         elif a.cmd == "numbering":
             d.bates(a.prefix, a.start); d.save(a.output)
+        elif a.cmd == "run":
+            with open(a.script) as fh:
+                code = compile(fh.read(), a.script, "exec")
+            exec(code, {"doc": d, "__name__": "__openrevu_script__"})  # noqa: S102 - user's own script, by design
+            d.save(a.output)
         elif a.cmd == "sheets":
             print(f"{d.auto_bookmarks()} bookmarks, {d.auto_hyperlinks()} links"); d.save(a.output)
         elif a.cmd == "footer":
             d.header_footer(footer=("", "Page {page} of {pages}", "")); d.save(a.output)
-    except (RuntimeError, OSError, ValueError, PermissionError, IndexError) as e:
+    except (RuntimeError, OSError, ValueError, PermissionError, IndexError, KeyError, SyntaxError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0
