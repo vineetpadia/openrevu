@@ -39,6 +39,7 @@ def main(argv=None) -> int:
     add("numbering", "Bates numbering", out, (("--prefix",), {"default": ""}), (("--start",), {"type": int, "default": 1}))
     add("run", "run a Python script with `doc` (an openrevu Document) preloaded; saves to output", out) \
         .add_argument("script")
+    add("pdfa", "export a PDF/A copy (needs Ghostscript; checked with veraPDF if installed)", out, (("--level",), {"default": "2b", "choices": ["1b", "2b", "3b"]}))
     add("sheets", "auto-bookmark sheet numbers and link sheet references", out)
     add("footer", "page x of y footer", out)
     a = p.parse_args(argv)
@@ -74,6 +75,11 @@ def main(argv=None) -> int:
             d.export_summary_csv(a.output)
         elif a.cmd == "numbering":
             d.bates(a.prefix, a.start); d.save(a.output)
+        elif a.cmd == "pdfa":
+            rep = d.export_pdfa(a.output, a.level)
+            print(rep.summary())
+            if rep.validated and not rep.compliant:
+                return 2
         elif a.cmd == "run":
             with open(a.script) as fh:
                 code = compile(fh.read(), a.script, "exec")

@@ -213,6 +213,24 @@ class DocumentOps:
             if n is not None:
                 self.statusBar().showMessage(f"{n} sheet reference link(s) created")
 
+    def export_pdfa(self):
+        if not self._need_doc():
+            return
+        level, ok = W.QInputDialog.getItem(self, "PDF/A", "Level:", ["2b", "1b", "3b"], 0, False)
+        if not ok:
+            return
+        p, _ = W.QFileDialog.getSaveFileName(self, "Save PDF/A copy", "", "PDF (*.pdf)")
+        if not p:
+            return
+        W.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            rep = self.doc.export_pdfa(p, level)
+        except ERRORS as e:
+            W.QApplication.restoreOverrideCursor()
+            return W.QMessageBox.warning(self, "PDF/A", str(e))
+        W.QApplication.restoreOverrideCursor()
+        (W.QMessageBox.information if (rep.compliant or not rep.validated) else W.QMessageBox.warning)(self, "PDF/A", rep.summary())
+
     def metadata(self):
         if self._need_doc():
             md = self.doc.doc.metadata or {}

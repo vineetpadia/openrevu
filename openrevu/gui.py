@@ -446,6 +446,7 @@ class Main(DocumentOps, W.QMainWindow):
         self._act(f, "Save As…", self.save_as, "Ctrl+Shift+S")
         self._act(f, "Save encrypted copy…", self.save_encrypted)
         self._act(f, "Optimize / compress copy…", self.optimize)
+        self._act(f, "Export as PDF/A…", self.export_pdfa)
         f.addSeparator()
         self._act(f, "Export page as PNG…", self.export_png)
         self._act(f, "Export markups list (CSV)…", lambda: self._export("csv"))

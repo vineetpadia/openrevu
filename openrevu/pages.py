@@ -330,6 +330,53 @@ class PageOps:
         md.update({k: v for k, v in fields.items() if k in ("title", "author", "subject", "keywords")})
         self.doc.set_metadata(md)
 
+    def export_pdfa(self, path, level="2b", flatten=True):
+        """Save a PDF/A copy (Ghostscript) and check it with veraPDF if available. Returns a PdfaReport.
+        By default markups are flattened first, because conversion may not keep every annotation."""
+        import tempfile, os
+        from . import pdfa
+        if not pdfa.available():
+            raise RuntimeError("PDF/A export needs Ghostscript (https://ghostscript.com) on your PATH.")
+        self._store_scales()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.pdf")
+            data = self.doc.tobytes()
+            tmpdoc = fitz.open("pdf", data)
+            if tmpdoc.needs_pass:
+                raise PermissionError("decrypt the document before you export it as PDF/A")
+            if level == "1b":
+                self._blend_transparency(tmpdoc)   # PDF/A-1 has no transparency
+            if flatten:
+                tmpdoc.bake(annots=True, widgets=True)
+            tmpdoc.save(src)
+            before = [pg.get_text().strip() for pg in tmpdoc]
+            tmpdoc.close()
+            rep = pdfa.convert(src, path, level)
+            out = fitz.open(path)
+            for i, text in enumerate(before):
+                if text and i < len(out) and not out[i].get_text().strip():
+                    rep.warnings.append(f"page {i + 1} lost its selectable text (it was drawn as an image). "
+                                        "It uses transparency, which this PDF/A level does not allow. Try level 2b.")
+            out.close()
+            return rep
+
+    @staticmethod
+    def _blend_transparency(doc):
+        """Replace each partly transparent markup colour by the same colour mixed with white, at full opacity."""
+        for pg in doc:
+            for a in list(pg.annots() or []):
+                op = a.opacity
+                if op is None or not (0 <= op < 1):
+                    continue
+                c = a.colors
+                mix = lambda col: tuple(v * op + (1 - op) for v in col) if col else None  # noqa: E731
+                try:
+                    a.set_colors(stroke=mix(c.get("stroke")), fill=mix(c.get("fill")))
+                    a.set_opacity(1)
+                    a.update()
+                except Exception:
+                    pass
+
     def optimize(self, path):
         """Save with maximum structural compression; returns (before, after) byte sizes."""
         self._store_scales()
