@@ -16,6 +16,7 @@ def test_versions_agree_and_tag_mismatch_is_caught():
     ok = run_check()
     assert ok.returncode == 0 and openrevu.__version__ in ok.stdout
     assert run_check(f"v{openrevu.__version__}").returncode == 0
+    assert run_check("").returncode == 0                       # a manual run has no tag
     bad = run_check("v99.0.0")
     assert bad.returncode == 1 and "does not match" in bad.stdout
 

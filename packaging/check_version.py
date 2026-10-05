@@ -18,7 +18,7 @@ def main(argv):
     problems = []
     if py != init:
         problems.append(f"pyproject.toml says {py} but openrevu/__init__.py says {init}")
-    if len(argv) > 1 and argv[1].lstrip("v") != py:
+    if len(argv) > 1 and argv[1] and argv[1].lstrip("v") != py:      # an empty tag means "no tag" (a manual run)
         problems.append(f"the tag {argv[1]} does not match the version {py}")
     for p in problems:
         print("version check failed:", p)
