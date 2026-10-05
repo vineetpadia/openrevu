@@ -463,6 +463,8 @@ class Document(SheetOps, PageOps):
         self._depth = 0
         self.generation = 0
         self._pcache: dict[int, fitz.Page] = {}
+        self.revision = 0            # counts changes, so caches know when to rebuild
+        self._link_doc, self._link_rev = None, -1
         self.viewports: list = []
         self.unit_style, self.fraction = "decimal", 16
         self.columns: list = []   # custom Markups List columns: {"name", "type", "choices"}
@@ -487,6 +489,7 @@ class Document(SheetOps, PageOps):
     def _invalidate_pages(self):
         """Call after anything that renumbers/replaces pages or reopens the document."""
         self._pcache = {}
+        self.revision += 1
         self.generation += 1
 
     # --- coordinate spaces ---
@@ -511,6 +514,7 @@ class Document(SheetOps, PageOps):
     MAX_UNDO = 30
 
     def checkpoint(self):
+        self.revision += 1
         self._store_scales()
         self._undo.append(self._dump())
         del self._undo[:-self.MAX_UNDO]

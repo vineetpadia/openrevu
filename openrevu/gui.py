@@ -20,11 +20,11 @@ TOOL_GROUPS = {
     "Shapes": ["Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Cloud", "Pen"],
     "Text & Review": ["Text", "Callout", "Note", "Highlight", "Underline", "Strikeout", "Squiggly"],
     "Stamp & Sign": ["Stamp", "Signature", "Redact"],
-    "Insert": ["Image", "Snapshot", "Link"],
+    "Insert": ["Image", "Snapshot", "CopyText", "Link"],
     "Measure": ["Calibrate", "Length", "Perimeter", "Area", "Fill", "RectArea", "EllipseArea", "Volume",
                 "Diameter", "Angle", "Count", "Viewport"],
 }
-LABELS = {"RectArea": "Rectangle area", "EllipseArea": "Ellipse area", "Fill": "Fill (room area)",
+LABELS = {"CopyText": "Copy text", "RectArea": "Rectangle area", "EllipseArea": "Ellipse area", "Fill": "Fill (room area)",
           "Calibrate": "Calibrate scale", "Length": "Length", "Viewport": "Viewport scale"}
 SHORTCUTS = {"Select": "V", "Pan": "H", "Rectangle": "R", "Ellipse": "E", "Line": "L", "Arrow": "A",
              "Polyline": "Y", "Cloud": "C", "Pen": "P", "Text": "T", "Callout": "O", "Note": "N",
@@ -48,6 +48,7 @@ TOOL_HINTS = {
     "Image": "Click or drag on the page. You choose the picture next.",
     "Snapshot": "Drag a region. OpenRevu copies it to the clipboard as a picture.",
     "Link": "Drag a region. Then enter a web address or a page number.",
+    "CopyText": "Drag over text. OpenRevu copies it to the clipboard.",
     "Redact": "Drag an area. Then use Document > Apply redactions to remove the content.",
     "Count": "Click each item to count. Set the group name in the toolbar.",
 }

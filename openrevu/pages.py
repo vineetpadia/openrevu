@@ -168,7 +168,10 @@ class PageOps:
 
     def links(self, pno):
         # PyMuPDF's in-memory link list lags behind insert_link on a modified page; a serialized copy is exact.
-        return fitz.open("pdf", self.doc.tobytes())[pno].get_links()
+        # The copy is rebuilt only when the document has changed.
+        if self._link_doc is None or self._link_rev != self.revision:
+            self._link_doc, self._link_rev = fitz.open("pdf", self.doc.tobytes()), self.revision
+        return self._link_doc[pno].get_links()
 
     @mutates
     def set_page_labels(self, rules):

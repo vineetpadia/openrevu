@@ -538,3 +538,51 @@ def test_import_btx_from_the_menu(win, tmp_path, monkeypatch):
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(lambda *a, **k: warned.append(a[2])))
     w.import_btx()
     assert warned and "not a readable tool set" in warned[0]
+
+
+# ---------- Copy Text tool and following links ----------
+def test_copy_text_tool(win):
+    w = win
+    QtWidgets.QApplication.clipboard().clear()
+    w.doc.doc[0].insert_text((100, 300), "Fire door FD30 rated", fontsize=12)
+    w.cv.invalidate()
+    w.set_tool("CopyText")
+    drag(w, 0, (90, 285), (300, 310))
+    assert QtWidgets.QApplication.clipboard().text() == "Fire door FD30 rated"
+    assert "Copied 20 characters" in w.statusBar().currentMessage()
+    w.set_tool("CopyText"); drag(w, 0, (400, 500), (500, 560))                    # a region without text
+    assert "no text in that region" in w.statusBar().currentMessage() and QtWidgets.QApplication.clipboard().text() == "Fire door FD30 rated"
+    assert w.doc.markups() == []
+
+
+def test_clicking_links_follows_page_links_and_opens_only_safe_web_links(win, monkeypatch):
+    w = win
+    w.doc.add_link_goto(0, fitz.Rect(100, 100, 200, 130), 2)
+    w.doc.add_link_uri(0, fitz.Rect(100, 200, 200, 230), "https://example.org/x")
+    w.doc.add_link_uri(0, fitz.Rect(100, 300, 200, 330), "file:///etc/passwd")
+    w.doc.add_link_uri(0, fitz.Rect(100, 400, 200, 430), "javascript:alert(1)")
+    opened = []
+    monkeypatch.setattr(QtGui.QDesktopServices, "openUrl", staticmethod(lambda url: opened.append(url.toString()) or True))
+    w.cv.set_zoom(0.5); w.cv.goto_page(0)
+    for y in (115, 215, 315, 415, 600):                                              # every click point is visible
+        assert w.cv.viewport().rect().contains(vp_pos(w, 0, 150, y)), y
+    for tool in ("Select", "Pan"):
+        w.set_tool(tool)
+        w.cv.goto_page(0); click(w, 0, 150, 115)
+        assert w.cv.current_page() == 2 and "Went to page 3" in w.statusBar().currentMessage()
+    w.cv.goto_page(0)
+    click(w, 0, 150, 215); assert opened == ["https://example.org/x"]
+    for y in (315, 415):
+        click(w, 0, 150, y)
+        assert "Did not open the link" in w.statusBar().currentMessage()
+    assert opened == ["https://example.org/x"]                                      # nothing else was opened
+    click(w, 0, 450, 600)                                                           # empty space: nothing happens
+    assert opened == ["https://example.org/x"]
+    # a drag is not a click: dragging over a link only pans
+    w.set_tool("Pan"); w.cv.set_zoom(2.0); w.cv.goto_page(0)
+    vp = w.cv.viewport(); p = vp_pos(w, 0, 150, 215)
+    QtTest.QTest.mousePress(vp, QtCore.Qt.LeftButton, pos=p)
+    QtWidgets.QApplication.sendEvent(vp, QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(p.x() + 30, p.y() + 30),
+                                     QtCore.Qt.NoButton, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier))
+    QtTest.QTest.mouseRelease(vp, QtCore.Qt.LeftButton, pos=QtCore.QPoint(p.x() + 30, p.y() + 30))
+    assert opened == ["https://example.org/x"]
