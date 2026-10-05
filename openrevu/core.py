@@ -12,6 +12,7 @@ import fitz  # PyMuPDF
 
 from ._util import mutates as _mutates
 from .pages import PageOps
+from .sheets import SheetOps
 
 TAG = "OpenRevu"
 UNITS = {"mm": 1 / 25.4, "cm": 1 / 2.54, "m": 1 / 0.0254, "in": 1.0, "ft": 1 / 12.0, "yd": 1 / 36.0}
@@ -370,7 +371,7 @@ class Markup:
         }
 
 
-class Document(PageOps):
+class Document(SheetOps, PageOps):
 
     def __init__(self, path: str | None = None, password: str | None = None):
         self.doc = self._open(path) if path else fitz.open()

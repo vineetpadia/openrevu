@@ -82,15 +82,20 @@ class PageOps:
         src = self._open(path)
         if src.needs_pass and not src.authenticate(password or ""):
             raise PermissionError("source PDF is encrypted")
+        if pages is not None and any(not 0 <= q < len(src) for q in pages):
+            raise IndexError(f"the source PDF has {len(src)} pages; asked for {sorted(pages)}")
         at = len(self.doc) if at is None else at
         n, k = len(self.doc), (len(pages) if pages is not None else len(src))
         kw = {"start_at": at}
+        from .sheets import copy_records
         if pages is not None:
             for p in pages:
                 self.doc.insert_pdf(src, from_page=p, to_page=p, start_at=at)
+                copy_records(src, [p], self.doc, at)
                 at += 1
         else:
             self.doc.insert_pdf(src, **kw)
+            copy_records(src, range(len(src)), self.doc, kw["start_at"])
         src.close()
         self._remap_scales({i: i + (k if i >= kw["start_at"] else 0) for i in range(n)})
         return k
@@ -107,9 +112,11 @@ class PageOps:
 
     def extract_pages(self, pnos, out_path):
         self._check(pnos)
+        from .sheets import copy_records
         out = fitz.open()
         for p in pnos:
             out.insert_pdf(self.doc, from_page=p, to_page=p)
+        copy_records(self.doc, pnos, out, 0)
         out.save(out_path, garbage=3, deflate=True)
         return out_path
 
