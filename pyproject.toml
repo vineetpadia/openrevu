@@ -1,0 +1,17 @@
+[project]
+name = "openrevu"
+version = "0.1.0"
+description = "Free PDF markup and takeoff tool (an open-source alternative to Bluebeam Revu)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = ["pymupdf>=1.24", "PyQt5>=5.15"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+openrevu = "openrevu.gui:main"
+
+[tool.setuptools]
+packages = ["openrevu"]
