@@ -24,7 +24,7 @@ FILES = {
     "Callout": "message-square-text", "Note": "sticky-note", "Stamp": "stamp", "Signature": "signature",
     "Calibrate": "ruler", "Length": "ruler-dimension-line", "Perimeter": "hexagon", "Area": "pentagon",
     "Fill": "paint-bucket", "RectArea": "square-dashed", "EllipseArea": "circle-dashed", "Volume": "box",
-    "Diameter": "diameter", "Angle": "triangle-right", "Count": "map-pin", "Viewport": "fullscreen",
+    "Diameter": "diameter", "Angle": "triangle-right", "Count": "map-pin", "Viewport": "fullscreen", "Image": "image", "Snapshot": "camera", "Link": "link",
     # actions and panels
     "open": "folder-open", "save": "save", "undo": "undo-2", "redo": "redo-2", "zoom-in": "zoom-in",
     "zoom-out": "zoom-out", "fit-width": "move-horizontal", "fit-page": "maximize", "page-up": "chevron-up",

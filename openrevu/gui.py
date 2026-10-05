@@ -20,6 +20,7 @@ TOOL_GROUPS = {
     "Shapes": ["Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Cloud", "Pen"],
     "Text & Review": ["Text", "Callout", "Note", "Highlight", "Underline", "Strikeout", "Squiggly"],
     "Stamp & Sign": ["Stamp", "Signature", "Redact"],
+    "Insert": ["Image", "Snapshot", "Link"],
     "Measure": ["Calibrate", "Length", "Perimeter", "Area", "Fill", "RectArea", "EllipseArea", "Volume",
                 "Diameter", "Angle", "Count", "Viewport"],
 }
@@ -44,6 +45,9 @@ TOOL_HINTS = {
     "Fill": "Click inside a closed room. Columns are subtracted.",
     "Viewport": "Drag a region that has its own scale, then enter the ratio (paper inches : real length : unit).",
     "Stamp": "Click or drag on the page to place the stamp.",
+    "Image": "Click or drag on the page. You choose the picture next.",
+    "Snapshot": "Drag a region. OpenRevu copies it to the clipboard as a picture.",
+    "Link": "Drag a region. Then enter a web address or a page number.",
     "Redact": "Drag an area. Then use Document > Apply redactions to remove the content.",
     "Count": "Click each item to count. Set the group name in the toolbar.",
 }
@@ -1569,11 +1573,39 @@ class Main(DocumentOps, W.QMainWindow):
             self._goto_hit_idx((self.search_list.currentRow() + 1) % len(self._hits))
 
 
+def install_excepthook(parent_getter=lambda: None):
+    """Show unexpected errors in a dialog. Without this, PyQt5 aborts the whole program on an error in an event handler."""
+    import traceback
+
+    busy = {"on": False}
+
+    def hook(etype, value, tb):
+        text = "".join(traceback.format_exception(etype, value, tb))
+        sys.stderr.write(text)
+        if busy["on"] or W.QApplication.instance() is None:
+            return
+        busy["on"] = True
+        try:
+            box = W.QMessageBox(parent_getter())
+            box.setIcon(W.QMessageBox.Critical)
+            box.setWindowTitle("OpenRevu")
+            box.setText("OpenRevu hit an unexpected problem.")
+            box.setInformativeText("You can keep working. Press Ctrl+S to save, or use Undo if something looks wrong.")
+            box.setDetailedText(text)
+            box.exec_()
+        finally:
+            busy["on"] = False
+
+    sys.excepthook = hook
+    return hook
+
+
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     app = W.QApplication(argv)
     app.setStyle("Fusion")
     win = Main(argv[1] if len(argv) > 1 else None)
+    install_excepthook(lambda: win)
     for extra in argv[2:]:
         win.open(extra)
     win.show()

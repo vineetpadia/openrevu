@@ -292,7 +292,7 @@ def test_tool_chest_panel_activates_tools_stamps_and_saved(win, monkeypatch, tmp
     w = win
     w.chest.path = str(tmp_path / "tc.json"); w.chest.items = {}
     top = {w.chest_tree.topLevelItem(i).text(0): w.chest_tree.topLevelItem(i) for i in range(w.chest_tree.topLevelItemCount())}
-    assert set(top) == {"Shapes", "Text & Review", "Stamp & Sign", "Measure", "Stamps", "My Tools"}
+    assert set(top) == {"Shapes", "Text & Review", "Stamp & Sign", "Insert", "Measure", "Stamps", "My Tools"}
     cloud = [top["Shapes"].child(i) for i in range(top["Shapes"].childCount()) if top["Shapes"].child(i).text(0) == "Cloud"][0]
     w._chest_clicked(cloud); assert w.cv.tool == "Cloud"
     rejected = [top["Stamps"].child(i) for i in range(top["Stamps"].childCount()) if top["Stamps"].child(i).text(0) == "REJECTED"][0]
@@ -452,3 +452,69 @@ def test_export_markup_summary_from_the_menu(win, tmp_path, monkeypatch):
     w.export_summary_pdf()
     assert "Markup Summary saved: 1 markup" in w.statusBar().currentMessage()
     assert "see this" in fitz.open(out)[0].get_text() and fitz.open(out)[0].get_images() == []
+
+
+# ---------- Image, Snapshot, Link tools ----------
+def test_snapshot_copies_the_region_to_the_clipboard(win):
+    w = win
+    QtWidgets.QApplication.clipboard().clear()
+    w.set_tool("Snapshot")
+    drag(w, 0, (100, 100), (300, 250))
+    img = QtWidgets.QApplication.clipboard().image()
+    assert not img.isNull() and abs(img.width() - 2 * 200) <= 4 and abs(img.height() - 2 * 150) <= 4     # 2x of a 200 x 150 pt region
+    assert "Snapshot copied" in w.statusBar().currentMessage() and w.doc.markups() == []                 # not stored in the PDF
+
+
+def test_image_tool_places_a_picture_by_drag_or_click(win, tmp_path, monkeypatch):
+    w = win
+    png = str(tmp_path / "logo.png")
+    pm = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 100, 50), False); pm.set_rect(pm.irect, (200, 30, 30)); pm.save(png)
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (png, "")))
+    w.set_tool("Image"); drag(w, 0, (100, 100), (300, 200))
+    m = [x for x in w.doc.markups() if x.subject == "Image"]
+    assert len(m) == 1 and m[0].kind == "Stamp" and m[0].rect.width <= 201
+    w.set_tool("Image"); click(w, 0, 100, 400)                                  # a click keeps the picture's proportions
+    r = [x for x in w.doc.markups() if x.subject == "Image"][-1].rect
+    assert r.width == pytest.approx(100, abs=3) and r.height == pytest.approx(50, abs=3) and r.y0 == pytest.approx(400, abs=3)
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: ("", "")))
+    n = len(w.doc.markups()); w.set_tool("Image"); drag(w, 0, (100, 500), (200, 560))
+    assert len(w.doc.markups()) == n                                            # cancelled: nothing placed
+    bad = tmp_path / "bad.png"; bad.write_bytes(b"not an image")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(bad), "")))
+    w.set_tool("Image"); drag(w, 0, (100, 500), (200, 560))
+    assert "Cannot use that image" in w.statusBar().currentMessage() and len(w.doc.markups()) == n
+
+
+def test_link_tool_makes_page_and_web_links_and_refuses_bad_input(win, monkeypatch):
+    w = win
+    def link(text, region=((100, 100), (200, 140))):
+        monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: (text, True)))
+        w.set_tool("Link"); drag(w, 0, *region)
+    link("3"); link("www.example.org", ((100, 200), (200, 240))); link("https://a.b/c", ((100, 300), (200, 340)))
+    links = w.doc.links(0)
+    assert sorted((l["kind"], l.get("page", l.get("uri"))) for l in links) == sorted(
+        [(fitz.LINK_GOTO, 2), (fitz.LINK_URI, "https://www.example.org"), (fitz.LINK_URI, "https://a.b/c")])
+    for bad, msg in (("99", "There is no page 99"), ("0", "There is no page 0"), ("javascript:alert(1)", "needs a page number"), ("hello", "needs a page number")):
+        n = len(w.doc.links(0)); link(bad, ((100, 400), (200, 440)))
+        assert msg in w.statusBar().currentMessage() and len(w.doc.links(0)) == n
+    n = len(w.doc.links(0))
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: ("", False)))
+    w.set_tool("Link"); drag(w, 0, (100, 500), (200, 540))
+    assert len(w.doc.links(0)) == n                                              # cancelled
+
+
+def test_unexpected_errors_show_a_dialog_instead_of_killing_the_app(app, monkeypatch):
+    import sys
+    from openrevu.gui import install_excepthook
+    seen = {}
+    monkeypatch.setattr(QtWidgets.QMessageBox, "exec_", lambda self: seen.update(text=self.text(), details=self.detailedText()) or 0)
+    old = sys.excepthook
+    hook = install_excepthook()
+    try:
+        try:
+            raise RuntimeError("boom from a handler")
+        except RuntimeError:
+            hook(*sys.exc_info())
+    finally:
+        sys.excepthook = old
+    assert seen["text"] == "OpenRevu hit an unexpected problem." and "boom from a handler" in seen["details"]

@@ -27,3 +27,15 @@ def no_unexpected_dialogs(monkeypatch):
                        (W.QFileDialog, ("getOpenFileName", "getOpenFileNames", "getSaveFileName", "getExistingDirectory"))):
         for n in names:
             monkeypatch.setattr(cls, n, boom(f"{cls.__name__}.{n}"))
+
+
+@pytest.fixture(autouse=True)
+def fail_on_unhandled_exceptions():
+    """An exception in a Qt event handler would abort the whole test run. Record it and fail only that test."""
+    import sys
+    errors = []
+    old = sys.excepthook
+    sys.excepthook = lambda t, v, tb: errors.append("".join(__import__("traceback").format_exception(t, v, tb)))
+    yield
+    sys.excepthook = old
+    assert not errors, "unhandled exception in an event handler:\n" + errors[0]

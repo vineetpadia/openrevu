@@ -9,7 +9,7 @@ from .core import UNITS, Document, Markup, Scale
 GAP = 14
 DRAG_TOOLS = {"Rectangle", "Ellipse", "Line", "Arrow", "Cloud", "Highlight", "Underline", "Strikeout",
               "Squiggly", "Calibrate", "Text", "Callout", "Redact", "RectArea", "EllipseArea", "Diameter",
-              "Stamp", "Signature", "Viewport"}
+              "Stamp", "Signature", "Viewport", "Snapshot", "Image", "Link"}
 POLY_TOOLS = {"Length", "Area", "Perimeter", "Volume", "Polyline"}
 ANGLE_TOOLS = {"Angle"}
 ALL_TOOLS = ["Select", "Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Cloud", "Pen", "Highlight",
@@ -391,7 +391,7 @@ class Canvas(W.QGraphicsView):
         a, b = self._start, self._to_pdf(self._pg, sp)
         pts, pno, self._start, self._pts = self._pts, self._pg, None, []
         self._clear_overlay()
-        if abs(a[0] - b[0]) + abs(a[1] - b[1]) < 3 and self.tool not in ("Stamp", "Signature"):
+        if abs(a[0] - b[0]) + abs(a[1] - b[1]) < 3 and self.tool not in ("Stamp", "Signature", "Image"):
             return self.invalidate([pno])
         self._commit_drag(pno, a, b, pts)
         self._pg = None
@@ -438,6 +438,28 @@ class Canvas(W.QGraphicsView):
         elif t == "RectArea": _, v = d.add_rect_area(pno, r); self.status.emit(f"Area: {v:.3f}")
         elif t == "EllipseArea": _, v = d.add_ellipse_area(pno, r); self.status.emit(f"Area: {v:.3f}")
         elif t == "Diameter": _, v = d.add_diameter(pno, a, b); self.status.emit(f"Diameter: {v:.3f}")
+        elif t == "Snapshot":
+            pix = d.render(pno, 2.0, clip=r)
+            img = QtGui.QImage(pix.samples, pix.width, pix.height, pix.stride, QtGui.QImage.Format_RGB888).copy()
+            W.QApplication.clipboard().setImage(img)
+            self.status.emit(f"Snapshot copied to the clipboard ({img.width()} x {img.height()} px). Paste it into another program.")
+            return self.invalidate([pno])
+        elif t == "Image":
+            path, _ = W.QFileDialog.getOpenFileName(self, "Choose an image", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)")
+            if not path:
+                return self.invalidate([pno])
+            try:
+                if r.width < 20:   # a click: keep the picture's own proportions
+                    pm = fitz.Pixmap(path)
+                    w0 = min(200.0, pm.width)
+                    r = fitz.Rect(a[0], a[1], a[0] + w0, a[1] + w0 * pm.height / pm.width)
+                d.add_image_stamp(pno, r, path)
+            except Exception as e:  # the image libraries raise many different types for a bad file
+                self.status.emit(f"Cannot use that image: {e}")
+                return self.invalidate([pno])
+        elif t == "Link":
+            self._add_link(pno, r)
+            return self._done([pno])
         elif t == "Calibrate":
             self._calibrate(pno, a, b)
             return self._done(None)
@@ -462,6 +484,25 @@ class Canvas(W.QGraphicsView):
         except ValueError as e:
             self.status.emit(str(e))
         self._done([pno])
+
+    def _add_link(self, pno, r):
+        """Ask for a web address or a page number, and make the dragged region a link."""
+        text, ok = W.QInputDialog.getText(self, "Link", "Web address (https://…) or page number:")
+        text = text.strip()
+        if not ok or not text:
+            return
+        if text.isdigit():
+            n = int(text)
+            if not 1 <= n <= self.doc.page_count:
+                return self.status.emit(f"There is no page {n}. The document has {self.doc.page_count} page(s).")
+            self.doc.add_link_goto(pno, r, n - 1)
+            return self.status.emit(f"Link to page {n} added. Click it in a PDF viewer to follow it.")
+        if text.lower().startswith("www."):
+            text = "https://" + text
+        if not text.lower().startswith(("http://", "https://", "mailto:")):
+            return self.status.emit("A link needs a page number or an address that starts with http://, https://, or mailto:")
+        self.doc.add_link_uri(pno, r, text)
+        self.status.emit(f"Link to {text} added.")
 
     def _calibrate(self, pno, a, b):
         ln, ok = W.QInputDialog.getDouble(self, "Calibrate", "Real length of the dragged segment:", 10, 1e-6, 1e9, 3)
