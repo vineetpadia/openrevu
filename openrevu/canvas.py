@@ -9,7 +9,7 @@ from .core import UNITS, Document, Markup, Scale
 GAP = 14
 DRAG_TOOLS = {"Rectangle", "Ellipse", "Line", "Arrow", "Cloud", "Highlight", "Underline", "Strikeout",
               "Squiggly", "Calibrate", "Text", "Callout", "Redact", "RectArea", "EllipseArea", "Diameter",
-              "Stamp", "Signature"}
+              "Stamp", "Signature", "Viewport"}
 POLY_TOOLS = {"Length", "Area", "Perimeter", "Volume", "Polyline"}
 ANGLE_TOOLS = {"Angle"}
 ALL_TOOLS = ["Select", "Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Cloud", "Pen", "Highlight",
@@ -251,7 +251,7 @@ class Canvas(W.QGraphicsView):
         elif t == "Fill":
             try:
                 _, v = self.doc.add_fill_area(pno, pt)
-                self.status.emit(f"Fill area: {v:.3f} {self.doc.scale_for(pno).unit}²")
+                self.status.emit(f"Fill area: {v:.3f} {self.doc.scale_at(pno, [pt]).unit}²")
             except (ValueError, RuntimeError) as e:
                 self.status.emit(str(e))
             self._done([pno])
@@ -320,15 +320,15 @@ class Canvas(W.QGraphicsView):
                 return self.invalidate([pno])
             c = self.color
             if t == "Length":
-                _, v = d.add_length(pno, pts); msg = f"Length: {v:.3f} {d.scale_for(pno).unit}"
+                _, v = d.add_length(pno, pts); msg = f"Length: {v:.3f} {d.scale_at(pno, pts).unit}"
             elif t == "Polyline":
                 d.add_polyline(pno, pts, c, self.width); msg = "Polyline added"
             elif t == "Perimeter":
-                _, v = d.add_perimeter(pno, pts); msg = f"Perimeter: {v:.3f} {d.scale_for(pno).unit}"
+                _, v = d.add_perimeter(pno, pts); msg = f"Perimeter: {v:.3f} {d.scale_at(pno, pts).unit}"
             elif t == "Area":
-                _, v = d.add_area(pno, pts); msg = f"Area: {v:.3f} {d.scale_for(pno).unit}²"
+                _, v = d.add_area(pno, pts); msg = f"Area: {v:.3f} {d.scale_at(pno, pts).unit}²"
             else:
-                _, v = d.add_area(pno, pts, depth=self.depth); msg = f"Volume: {v:.3f} {d.scale_for(pno).unit}³"
+                _, v = d.add_area(pno, pts, depth=self.depth); msg = f"Volume: {v:.3f} {d.scale_at(pno, pts).unit}³"
             self.status.emit(msg)
             self._done([pno])
 
@@ -410,6 +410,16 @@ class Canvas(W.QGraphicsView):
         elif t == "Diameter": _, v = d.add_diameter(pno, a, b); self.status.emit(f"Diameter: {v:.3f}")
         elif t == "Calibrate":
             self._calibrate(pno, a, b)
+            return self._done(None)
+        elif t == "Viewport":
+            txt, ok = W.QInputDialog.getText(self, "Viewport scale", "paper inches : real length : unit  (e.g. 0.5:1:ft)", text="0.25:1:ft")
+            if ok:
+                try:
+                    pi, rl, un = txt.split(":")
+                    d.add_viewport(pno, r, Scale.from_ratio(float(pi), float(rl), un.strip()))
+                    self.status.emit("Viewport added: measurements inside it use its own scale")
+                except ValueError as e:
+                    self.status.emit(f"Invalid viewport: {e}")
             return self._done(None)
         self._done([pno])
 

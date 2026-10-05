@@ -277,7 +277,7 @@ class Markup:
     def _remeasure(self, kind):
         """Recompute the stored value (and relabel) after the geometry changed."""
         d, pno = self.d, self.page_no
-        sc = d.scale_for(pno)
+        sc = d.scale_at(pno, [self.rect.tl, self.rect.br])
         if self.kind == "Circle":
             l, t, r_, b_ = self._rd()
             vr = self.rect
@@ -377,6 +377,7 @@ class Document(PageOps):
         self._depth = 0
         self.generation = 0
         self._pcache: dict[int, fitz.Page] = {}
+        self.viewports: list = []
         self._undo: list[bytes] = []
         self._redo: list[bytes] = []
         self.modified = False
@@ -459,11 +460,14 @@ class Document(PageOps):
 
     # --- scales (default + per page), persisted in PDF keywords ---
     def _load_scales(self):
+        self.viewports = []
         kw = (self.doc.metadata or {}).get("keywords") or ""
         for part in kw.split(";"):
             if part.startswith(TAG + "-scales="):
                 try:
                     d = json.loads(part.split("=", 1)[1])
+                    self.viewports = [(int(v["page"]), fitz.Rect(v["rect"]), Scale.from_dict(v["scale"]))
+                                      for v in d.get("viewports", [])]
                     return Scale.from_dict(d["default"]), {int(k): Scale.from_dict(v) for k, v in d["pages"].items()}
                 except (ValueError, KeyError, TypeError):
                     pass
@@ -472,7 +476,8 @@ class Document(PageOps):
     def _store_scales(self):
         md = dict(self.doc.metadata or {})
         kw = [p for p in (md.get("keywords") or "").split(";") if p and not p.startswith(TAG + "-scale")]
-        blob = {"default": self.default_scale.to_dict(), "pages": {str(k): v.to_dict() for k, v in self.page_scales.items()}}
+        blob = {"default": self.default_scale.to_dict(), "pages": {str(k): v.to_dict() for k, v in self.page_scales.items()},
+                "viewports": [{"page": p, "rect": list(r), "scale": sc.to_dict()} for p, r, sc in self.viewports]}
         kw.append(f"{TAG}-scales={json.dumps(blob)}")
         md["keywords"] = ";".join(kw)
         self.doc.set_metadata(md)
@@ -483,6 +488,28 @@ class Document(PageOps):
 
     def scale_for(self, pno: int) -> Scale:
         return self.page_scales.get(pno, self.default_scale)
+
+    def scale_at(self, pno: int, pts) -> Scale:
+        """Scale that applies at the centroid of pts: the innermost-last viewport containing it, else the page scale."""
+        pts = list(pts)
+        c = fitz.Point(sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+        for p, r, sc in reversed(self.viewports):
+            if p == pno and r.contains(c):
+                return sc
+        return self.scale_for(pno)
+
+    def add_viewport(self, pno: int, rect, scale: Scale):
+        """Give a region of a page its own scale (e.g. a detail drawn at a different scale)."""
+        self._check([pno])
+        r = fitz.Rect(rect).normalize()
+        if r.is_empty:
+            raise ValueError("viewport must have an area")
+        self.checkpoint()
+        self.viewports.append((pno, r, scale))
+
+    def remove_viewport(self, index: int):
+        self.checkpoint()
+        del self.viewports[index]
 
     def set_scale(self, scale: Scale, page: int | None = None, pages=None, reset_pages: bool = False):
         """Set the default scale, or the scale of one page / a list of pages.
@@ -682,7 +709,7 @@ class Document(PageOps):
     @_mutates
     def add_length(self, pno, pts, color=(0, 0.4, 1), label=True, subject="Length"):
         pts = [tuple(p) for p in pts]
-        sc = self.scale_for(pno)
+        sc = self.scale_at(pno, pts)
         v = sc.length(pts)
         pg = self._page(pno)
         up = self._tus(pno, pts)
@@ -696,7 +723,7 @@ class Document(PageOps):
     @_mutates
     def add_perimeter(self, pno, pts, color=(0, 0.4, 1), label=True, subject="Perimeter"):
         pts = [tuple(p) for p in pts]
-        sc = self.scale_for(pno)
+        sc = self.scale_at(pno, pts)
         v = sc.length(pts + pts[:1])
         a = self._page(pno).add_polygon_annot(self._tus(pno, pts))
         self._finish(a, color, 1.5, subject, measure=f"perimeter:{v:.10g}:{sc.unit}")
@@ -708,7 +735,7 @@ class Document(PageOps):
     def add_area(self, pno, pts, color=(0, 0.6, 0.2), label=True, subject="Area", cutouts=(), depth=None):
         """Polygon area minus cutouts. If depth is given (real units) a volume is recorded instead."""
         pts = [tuple(p) for p in pts]
-        sc = self.scale_for(pno)
+        sc = self.scale_at(pno, pts)
         v = sc.area(pts) - sum(sc.area(c) for c in cutouts)
         if v < 0:
             raise ValueError("cutouts exceed the area")
@@ -761,7 +788,7 @@ class Document(PageOps):
     @_mutates
     def add_ellipse_area(self, pno, rect, color=(0, 0.6, 0.2), label=True, subject="Area"):
         r = fitz.Rect(rect).normalize()
-        sc = self.scale_for(pno)
+        sc = self.scale_at(pno, [tuple(r.tl), tuple(r.br)])
         v = math.pi * (r.width / 2) * (r.height / 2) * sc.unit_per_pt ** 2
         a = self._page(pno).add_circle_annot(self._ru(pno, r))
         self._finish(a, color, 1.5, subject, fill=color, opacity=0.25, measure=f"area:{v:.10g}:{sc.unit}")
@@ -774,7 +801,7 @@ class Document(PageOps):
         """Circle through the diameter p1-p2; records the diameter length."""
         c = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
         rad = math.dist(p1, p2) / 2
-        sc = self.scale_for(pno)
+        sc = self.scale_at(pno, [p1, p2])
         v = math.dist(p1, p2) * sc.unit_per_pt
         a = self._page(pno).add_circle_annot(self._ru(pno, fitz.Rect(c[0] - rad, c[1] - rad, c[0] + rad, c[1] + rad)))
         self._finish(a, color, 1.5, subject, measure=f"diameter:{v:.10g}:{sc.unit}")

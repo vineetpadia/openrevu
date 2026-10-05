@@ -198,3 +198,16 @@ def test_fill_tool_measures_clicked_room(app, tmp_path):
     click(w, 0, 500, 600)  # outside: error reported, nothing added
     assert len([m for m in w.doc.markups() if m.measurement()]) == 1
     assert "enclosed" in w.statusBar().currentMessage()
+
+
+def test_viewport_tool_and_sheet_actions(win, monkeypatch):
+    w = win
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: ("0.5:1:m", True)))
+    w.set_tool("Viewport")
+    drag(w, 0, (200, 200), (400, 400))
+    assert len(w.doc.viewports) == 1 and w.doc.viewports[0][2].unit == "m"
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: ("bogus", True)))
+    drag(w, 0, (100, 500), (150, 550))
+    assert len(w.doc.viewports) == 1 and "Invalid" in w.statusBar().currentMessage()
+    w.auto_bookmarks()
+    assert "No sheet numbers" in w.statusBar().currentMessage() or "created" in w.statusBar().currentMessage()

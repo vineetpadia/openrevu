@@ -37,6 +37,7 @@ def main(argv=None) -> int:
     add("summary", "export measurement summary CSV", (("output",), {}))
     add("compare", "overlay compare two PDFs", (("new",), {}), out)
     add("numbering", "Bates numbering", out, (("--prefix",), {"default": ""}), (("--start",), {"type": int, "default": 1}))
+    add("sheets", "auto-bookmark sheet numbers and link sheet references", out)
     add("footer", "page x of y footer", out)
     a = p.parse_args(argv)
     try:
@@ -71,6 +72,8 @@ def main(argv=None) -> int:
             d.export_summary_csv(a.output)
         elif a.cmd == "numbering":
             d.bates(a.prefix, a.start); d.save(a.output)
+        elif a.cmd == "sheets":
+            print(f"{d.auto_bookmarks()} bookmarks, {d.auto_hyperlinks()} links"); d.save(a.output)
         elif a.cmd == "footer":
             d.header_footer(footer=("", "Page {page} of {pages}", "")); d.save(a.output)
     except (RuntimeError, OSError, ValueError, PermissionError, IndexError) as e:

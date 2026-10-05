@@ -380,6 +380,50 @@ class PageOps:
         w.border_color, w.fill_color = (0, 0, 0), (0.95, 0.95, 1)
         self._page(pno).add_widget(w)
 
+    # ---- sheet manager ----
+    SHEET_RE = r"\b[A-Z]{1,3}[-.]?\d{1,3}(?:\.\d{1,2})?\b"
+
+    def sheet_index(self, pattern=None, corner=None):
+        """Detect each page's sheet number (largest text matching `pattern`; `corner` optionally restricts the search
+        to a visual-coordinate rect such as the title block). Returns [(page, number or None)]."""
+        import re
+        rx = re.compile(pattern or self.SHEET_RE)
+        out = []
+        for i, pg in enumerate(self.doc):
+            best = (0.0, None)
+            for b in pg.get_text("dict")["blocks"]:
+                for ln in b.get("lines", []):
+                    for sp in ln["spans"]:
+                        t = sp["text"].strip()
+                        if corner is not None and not fitz.Rect(corner).intersects(self._rv(i, fitz.Rect(sp["bbox"]))):
+                            continue
+                        if rx.fullmatch(t) and sp["size"] > best[0]:
+                            best = (sp["size"], t)
+            out.append((i, best[1]))
+        return out
+
+    @mutates
+    def auto_bookmarks(self, pattern=None, corner=None):
+        """Replace bookmarks with one per detected sheet number. Returns how many were created."""
+        toc = [[1, num, i + 1] for i, num in self.sheet_index(pattern, corner) if num]
+        self.doc.set_toc(toc)
+        return len(toc)
+
+    @mutates
+    def auto_hyperlinks(self, pattern=None, corner=None):
+        """Turn every whole-word mention of another sheet's number (e.g. 'see A-102') into a link to that sheet."""
+        sheets = {num: i for i, num in self.sheet_index(pattern, corner) if num}
+        made = 0
+        for i in range(len(self.doc)):
+            pg = self._page(i)
+            for x0, y0, x1, y1, word, *_ in pg.get_text("words"):
+                num = word.strip(".,;:()[]")
+                target = sheets.get(num)
+                if target is not None and target != i:
+                    pg.insert_link({"kind": fitz.LINK_GOTO, "from": fitz.Rect(x0, y0, x1, y1), "page": target})
+                    made += 1
+        return made
+
     # ---- layers ----
     def layers(self):
         return [{**c, "on": bool(c["on"])} for c in self.doc.layer_ui_configs()]

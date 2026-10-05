@@ -892,3 +892,67 @@ def test_fill_area_accuracy_within_half_percent(tmp_path):
     doc.set_scale(Scale("m", 1.0))
     _, v = doc.add_fill_area(0, (110, 110))
     assert v == pytest.approx(99 * 99 - 21 * 21, rel=0.005)
+
+
+# ---------- viewports & sheet manager ----------
+def test_viewport_scales(pdf, tmp_path):
+    d = Document(pdf)
+    d.set_scale(Scale("ft", 1.0))                       # page: 1 pt = 1 ft
+    d.add_viewport(0, fitz.Rect(300, 300, 500, 500), Scale("m", 0.1))   # detail: 1 pt = 0.1 m
+    d.add_viewport(0, fitz.Rect(350, 350, 400, 400), Scale("in", 2.0))  # nested: last wins
+    assert d.scale_at(0, [(10, 10)]).unit == "ft"
+    assert d.scale_at(0, [(320, 320), (330, 330)]).unit == "m"
+    assert d.scale_at(0, [(370, 370)]).unit == "in"
+    assert d.scale_at(1, [(370, 370)]).unit == "ft"       # other page unaffected
+    _, a = d.add_length(0, [(10, 10), (20, 10)]); _, b = d.add_length(0, [(310, 310), (320, 310)])
+    assert a == pytest.approx(10) and b == pytest.approx(1)
+    assert {m.measurement()[2] for m in d.markups()} == {"ft", "m"}
+    out = str(tmp_path / "v.pdf"); d.save(out)
+    r = Document(out)
+    assert len(r.viewports) == 2 and r.scale_at(0, [(320, 320)]).unit == "m"
+    with pytest.raises(ValueError):
+        d.add_viewport(0, fitz.Rect(5, 5, 5, 5), Scale())
+    with pytest.raises(IndexError):
+        d.add_viewport(9, fitz.Rect(0, 0, 5, 5), Scale())
+    assert len(d.viewports) == 2  # failed adds changed nothing
+
+
+def test_viewport_undo_and_remove(pdf):
+    d = Document(pdf)
+    d.add_viewport(0, fitz.Rect(0, 0, 100, 100), Scale("m", 0.5))
+    assert len(d.viewports) == 1
+    d.undo()
+    assert d.viewports == []
+    d.redo(); assert len(d.viewports) == 1
+    d.remove_viewport(0); assert d.viewports == []
+    d.undo(); assert len(d.viewports) == 1
+
+
+def sheets_pdf(path):
+    d = fitz.open()
+    for i, n in enumerate(["A-101", "A-102", "S-201"]):
+        p = d.new_page(width=612, height=792)
+        p.insert_text((450, 740), n, fontsize=28)                         # title block number (largest text)
+        p.insert_text((72, 100), f"Plan. See {n if i == 0 else 'A-101'} and S-201, not A-1011.", fontsize=10)
+    d.save(path); return str(path)
+
+
+def test_sheet_index_bookmarks_and_links(tmp_path):
+    d = Document(sheets_pdf(tmp_path / "set.pdf"))
+    assert d.sheet_index() == [(0, "A-101"), (1, "A-102"), (2, "S-201")]
+    assert d.sheet_index(corner=fitz.Rect(0, 0, 612, 200)) == [(0, None), (1, None), (2, None)]
+    assert d.auto_bookmarks() == 3
+    assert [t[1] for t in d.toc()] == ["A-101", "A-102", "S-201"] and [t[2] for t in d.toc()] == [1, 2, 3]
+    n = d.auto_hyperlinks()
+    assert n == 4  # p1: S-201 | p2: A-101, S-201 | p3: A-101  (A-1011 never matches; a sheet's own number is skipped)
+    pages_linked = sorted((p, l["page"]) for p in range(3) for l in d.links(p))
+    assert (0, 2) in pages_linked and (1, 0) in pages_linked and (2, 0) in pages_linked
+    assert all(l["page"] != p for p in range(3) for l in d.links(p))
+
+
+def test_cli_sheets(tmp_path):
+    from openrevu.cli import main
+    out = str(tmp_path / "o.pdf")
+    assert main(["sheets", sheets_pdf(tmp_path / "set.pdf"), out]) == 0
+    d = Document(out)
+    assert len(d.toc()) == 3 and len(d.links(0)) == 1

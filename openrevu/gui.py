@@ -16,7 +16,7 @@ from .toolchest import ToolChest
 MARKUP_TOOLS = ["Select", "Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Cloud", "Pen", "Highlight",
                 "Underline", "Strikeout", "Squiggly", "Text", "Callout", "Note", "Stamp", "Signature", "Redact"]
 MEASURE_TOOLS = ["Calibrate", "Length", "Perimeter", "Area", "Fill", "RectArea", "EllipseArea", "Volume", "Diameter",
-                 "Angle", "Count"]
+                 "Angle", "Count", "Viewport"]
 STAMPS = ["APPROVED", "REVIEWED", "REJECTED", "DRAFT", "FOR CONSTRUCTION", "VOID", "AS BUILT", "CONFIDENTIAL"]
 ERRORS = (ValueError, IndexError, RuntimeError, PermissionError, OSError, KeyError)
 
@@ -267,6 +267,7 @@ class Main(W.QMainWindow):
                          ("Watermark (image)…", self.watermark_image), ("Bates numbering…", self.bates),
                          ("Flatten markups", self.flatten), ("Apply redactions", self.apply_redactions),
                          ("Redact text matches…", self.redact_text), ("OCR (needs tesseract)…", self.ocr),
+                         ("Auto-bookmark sheets", self.auto_bookmarks), ("Auto-link sheet references", self.auto_links),
                          ("Properties…", self.metadata), ("Compare with another PDF…", self.compare),
                          ("Fill form field…", self.fill_form), ("Layers…", self.layers_dialog)):
             self._act(d, text, fn)
@@ -962,6 +963,19 @@ class Main(W.QMainWindow):
             n = self._run(self.doc.ocr, structural=True)
             if n is not None:
                 self.statusBar().showMessage(f"OCR added a text layer to {n} page(s)")
+
+    def auto_bookmarks(self):
+        if self._need_doc():
+            n = self._run(self.doc.auto_bookmarks)
+            if n is not None:
+                self.refresh_toc()
+                self.statusBar().showMessage(f"{n} sheet bookmark(s) created" if n else "No sheet numbers found")
+
+    def auto_links(self):
+        if self._need_doc():
+            n = self._run(self.doc.auto_hyperlinks)
+            if n is not None:
+                self.statusBar().showMessage(f"{n} sheet reference link(s) created")
 
     def metadata(self):
         if self._need_doc():

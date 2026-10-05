@@ -23,8 +23,9 @@ OCR needs the `tesseract` binary on PATH (tested with 5.5); room fill needs `num
 | Markup | rectangle, ellipse, line, arrow, polyline, revision cloud, freehand, highlight / underline / strikeout / squiggly, text box, callout, note, custom stamps (name + date), image stamps, visual signature, redaction marks |
 | Editing | select, move, resize, delete, copy/paste/duplicate, properties panel (colour, fill, width, opacity, subject, comment), undo/redo (30 levels) |
 | Review | status (Accepted/Rejected/…), threaded replies, author, sortable/filterable Markups List, CSV export |
-| Measurement | scale by calibration or ratio, per-page scales (persisted in the PDF), length, polylength, perimeter, area (with cut-outs), **Dynamic-Fill-style room area (click inside a room; columns become cut-outs)**, rectangle/ellipse area, volume (area × depth), diameter, angle, counts by group, resize-and-re-measure, measurement summary + CSV |
+| Measurement | scale by calibration or ratio, per-page scales and **viewport scales** for details drawn at a different scale (persisted in the PDF), length, polylength, perimeter, area (with cut-outs), **Dynamic-Fill-style room area (click inside a room; columns become cut-outs)**, rectangle/ellipse area, volume (area × depth), diameter, angle, counts by group, resize-and-re-measure, measurement summary + CSV |
 | Tool Chest | save any markup as a reusable preset (JSON), place it anywhere |
+| Sheets | auto-detect sheet numbers, auto-bookmarks, auto-hyperlink sheet references (also `openrevu-cli sheets`) |
 | Pages | insert blank/PDF/image, delete, rotate, move, extract, split, crop, page labels, merge |
 | Document | header/footer with `{page}` `{pages}` `{date}`, text & image watermark, Bates numbering, flatten, permanent redaction (text, images, line art), OCR text layer, metadata, forms (create / list / fill), layers (toggle), overlay comparison, optimize, AES-256 encryption |
 | Signing | cryptographic PKCS#12 signatures + verification with your own trust roots (pyhanko) |
@@ -33,8 +34,8 @@ OCR needs the `tesseract` binary on PATH (tested with 5.5); room fill needs `num
 ## Known gaps vs. Bluebeam Revu (be honest before depending on it)
 - **No real-time collaboration** (Studio Sessions / Projects) or cloud storage. This needs a server and is out of scope
   for a local app; share files and use the Markups List CSV / status / replies for review rounds.
-- No viewport-based scales (one scale per page), no `.bpx`/`.bax` import (Tool Chest uses JSON).
-- Revu's proprietary features not replicated: scripting, PDF/A conversion, Sheet Manager / hyperlink auto-generation.
+- No `.bpx`/`.bax` import (Tool Chest uses JSON). No PDF/A conversion and no macro scripting (use `openrevu-cli` or import `openrevu.core` from Python).
+- Sheet Manager is a lightweight version: it detects sheet numbers by pattern and builds bookmarks and links, but has no sheet-set database or revision tracking.
 - Overlay compare is pixel-based (no semantic/text diff) and slow on large sheets.
 - Dynamic Fill needs a closed boundary at the render resolution (gaps leak and are reported); it traces the room outline,
   so curved walls become many short segments.
