@@ -9,7 +9,7 @@ import math
 import os
 from dataclasses import dataclass
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 
 from ._util import mutates as _mutates
 from .pages import PageOps

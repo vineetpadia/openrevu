@@ -11,7 +11,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-import fitz
+import pymupdf as fitz  # PyMuPDF
 
 from ._util import mutates
 

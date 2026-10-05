@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime
 import re
 
-import fitz
+import pymupdf as fitz  # PyMuPDF
 
 PAGE_W, PAGE_H, MARGIN = 612, 792, 40
 IMG_W, IMG_H = 130, 84

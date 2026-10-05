@@ -109,6 +109,7 @@ def test_report_without_images_and_with_status_filter(pdf, tmp_path):
     assert d.export_markup_summary(out, include_images=False, statuses=["Accepted"]) == 1
     r = fitz.open(out)
     assert r[0].get_images() == [] and "Wall crack" in r[0].get_text() and "Check beam size" not in r[0].get_text()
+    r.close()                                                         # Windows cannot overwrite a file that is still open
     assert d.export_markup_summary(out, statuses=[""]) == 2           # only markups with no status
 
 

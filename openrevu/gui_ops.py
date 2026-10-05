@@ -1,7 +1,7 @@
 """Document-level operations (pages, headers, redaction, OCR, signing...) used by the main window."""
 from __future__ import annotations
 
-import fitz
+import pymupdf as fitz  # PyMuPDF
 from PyQt5 import QtCore, QtWidgets as W
 
 from .core import Scale

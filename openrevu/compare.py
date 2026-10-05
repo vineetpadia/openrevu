@@ -5,7 +5,7 @@ import csv
 import difflib
 from dataclasses import dataclass, field
 
-import fitz
+import pymupdf as fitz  # PyMuPDF
 
 try:
     import numpy as np

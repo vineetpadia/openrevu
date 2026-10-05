@@ -12,14 +12,19 @@ from dataclasses import dataclass, field
 
 LEVELS = {"1b": 1, "2b": 2, "3b": 3}
 
-_DEF_PS = """%!
-[/_objdef {icc_PDFA} /type /stream /OBJ pdfmark
-[{icc_PDFA} << /N 3 >> /PUT pdfmark
-[{icc_PDFA} (%rom%iccprofiles/default_rgb.icc) (r) file /PUT pdfmark
-[/_objdef {OutputIntent_PDFA} /type /dict /OBJ pdfmark
-[{OutputIntent_PDFA} << /Type /OutputIntent /S /GTS_PDFA1 /DestOutputProfile {icc_PDFA} /OutputConditionIdentifier (sRGB) /Info (sRGB) >> /PUT pdfmark
-[{Catalog} << /OutputIntents [ {OutputIntent_PDFA} ] >> /PUT pdfmark
-"""
+def _def_ps() -> str:
+    """The PostScript file that adds the PDF/A output intent. The colour profile is written inline, as a hex string:
+    Ghostscript's safe mode does not let a PostScript file read other files, and its own copy of a profile is in
+    different places (or missing) on different systems."""
+    from .srgb import srgb_profile
+    return ("%!\n"
+            "[/_objdef {icc_PDFA} /type /stream /OBJ pdfmark\n"
+            "[{icc_PDFA} << /N 3 >> /PUT pdfmark\n"
+            f"[{{icc_PDFA}} <{srgb_profile().hex()}> /PUT pdfmark\n"
+            "[/_objdef {OutputIntent_PDFA} /type /dict /OBJ pdfmark\n"
+            "[{OutputIntent_PDFA} << /Type /OutputIntent /S /GTS_PDFA1 /DestOutputProfile {icc_PDFA} "
+            "/OutputConditionIdentifier (sRGB) /Info (sRGB) >> /PUT pdfmark\n"
+            "[{Catalog} << /OutputIntents [ {OutputIntent_PDFA} ] >> /PUT pdfmark\n")
 
 
 @dataclass
@@ -89,15 +94,17 @@ def convert(src: str, dst: str, level: str = "2b", check: bool = True, timeout: 
         raise ValueError("the output file must differ from the input file")
     with tempfile.TemporaryDirectory() as tmp:
         ps = os.path.join(tmp, "pdfa_def.ps")
-        with open(ps, "w") as f:
-            f.write(_DEF_PS)
+        with open(ps, "w", encoding="ascii") as f:
+            f.write(_def_ps())
         out = os.path.join(tmp, "out.pdf")
         cmd = [gs, "-q", "-dBATCH", "-dNOPAUSE", "-dNOOUTERSAVE", "-sDEVICE=pdfwrite", f"-dPDFA={LEVELS[level]}",
                "-dPDFACompatibilityPolicy=1", "-sColorConversionStrategy=RGB", "-sProcessColorModel=DeviceRGB",
                "-dEmbedAllFonts=true", f"-sOutputFile={out}", ps, src]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0 or not os.path.exists(out):
-            raise RuntimeError(f"Ghostscript failed: {(r.stderr or r.stdout).strip()[:300]}")
+            # Ghostscript writes the cause to stdout and a short summary to stderr: show both
+            detail = " ".join(x.strip() for x in (r.stdout, r.stderr) if x.strip())
+            raise RuntimeError(f"Ghostscript failed (exit code {r.returncode}): {detail[:700]}")
         shutil.move(out, dst)
     if check and verapdf():
         return validate(dst, level)

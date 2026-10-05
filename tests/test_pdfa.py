@@ -135,3 +135,53 @@ def test_dropped_links_and_turned_pages_are_reported(tmp_path):
     assert "Warning:" in rep.summary() or kept == 2 or not rep.warnings
     if abs(out[1].rect.width - d.doc[1].rect.width) > 1:
         assert any("page 2 was turned" in w for w in rep.warnings)
+
+
+# ---------- the colour profile and Ghostscript's safe mode ----------
+def test_the_generated_srgb_profile_is_a_well_formed_icc_profile():
+    import struct
+    from openrevu.srgb import srgb_profile
+    p = srgb_profile()
+    assert int.from_bytes(p[:4], "big") == len(p) and len(p) % 4 == 0
+    assert p[12:16] == b"mntr" and p[16:20] == b"RGB " and p[20:24] == b"XYZ " and p[36:40] == b"acsp"
+    assert p[8:12] == bytes([2, 0x10, 0, 0])                                    # version 2.1
+    n = struct.unpack(">I", p[128:132])[0]
+    tags = {p[132 + 12 * i:136 + 12 * i]: struct.unpack(">II", p[136 + 12 * i:144 + 12 * i]) for i in range(n)}
+    assert set(tags) == {b"desc", b"cprt", b"wtpt", b"rXYZ", b"gXYZ", b"bXYZ", b"rTRC", b"gTRC", b"bTRC"}
+    for sig, (off, size) in tags.items():
+        assert off % 4 == 0 and off + size <= len(p), sig                         # every tag lies inside the file, aligned
+    off, size = tags[b"rTRC"]
+    count = struct.unpack(">I", p[off + 8:off + 12])[0]
+    vals = struct.unpack(f">{count}H", p[off + 12:off + 12 + 2 * count])
+    assert vals[0] == 0 and vals[-1] == 65535 and all(a <= b for a, b in zip(vals, vals[1:]))   # a rising curve from 0 to 1
+    assert tags[b"gTRC"] == tags[b"rTRC"] == tags[b"bTRC"]                      # the three curves share one block
+    x = struct.unpack(">i", p[tags[b"wtpt"][0] + 8:tags[b"wtpt"][0] + 12])[0] / 65536
+    assert abs(x - 0.9642) < 1e-3                                                # the D50 white point
+
+
+@needs_gs
+@needs_vera
+def test_our_profile_is_embedded_and_conversion_needs_no_file_access(doc, tmp_path):
+    out = str(tmp_path / "a.pdf")
+    rep = doc.export_pdfa(out, "2b")
+    assert rep.compliant
+    f = fitz.open(out)
+    streams = b"".join(f.xref_stream(x) or b"" for x in range(1, f.xref_length()) if f.xref_is_stream(x))
+    assert b"sRGB (OpenRevu)" in streams                                            # the profile of this program, not Ghostscript's
+    assert "OutputIntents" in f.xref_object(f.pdf_catalog())
+
+
+@needs_gs
+def test_the_postscript_never_reads_a_file():
+    from openrevu.pdfa import _def_ps
+    ps = _def_ps()
+    assert "(r) file" not in ps and "%rom%" not in ps and ps.startswith("%!")        # safe mode would refuse a file read
+    assert all(ord(c) < 128 for c in ps)
+
+
+@needs_gs
+def test_a_ghostscript_failure_shows_the_cause(tmp_path):
+    with pytest.raises(RuntimeError) as e:
+        pdfa.convert(str(tmp_path / "missing.pdf"), str(tmp_path / "o.pdf"), check=False)
+    assert "exit code" in str(e.value) and "missing.pdf" in str(e.value)       # the cause is in the message, not just "failed"
+    assert not (tmp_path / "o.pdf").exists()                                    # and no partial output is left behind

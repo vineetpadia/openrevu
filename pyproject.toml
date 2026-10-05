@@ -9,7 +9,7 @@ description = "Free PDF markup, measurement/takeoff and review tool (an open-sou
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "AGPL-3.0-or-later" }
-dependencies = ["pymupdf>=1.24", "PyQt5>=5.15", "numpy"]
+dependencies = ["pymupdf>=1.24.3", "PyQt5>=5.15", "numpy"]
 
 [project.optional-dependencies]
 sign = ["pyhanko>=0.25"]

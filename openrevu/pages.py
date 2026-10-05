@@ -5,7 +5,7 @@ import datetime
 import os
 import shutil
 
-import fitz
+import pymupdf as fitz  # PyMuPDF
 
 from ._util import mutates
 

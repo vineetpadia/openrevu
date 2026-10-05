@@ -1,7 +1,7 @@
 """Continuous-scroll PDF canvas with markup tools, selection, move and resize."""
 from __future__ import annotations
 
-import fitz
+import pymupdf as fitz  # PyMuPDF
 from PyQt5 import QtCore, QtGui, QtWidgets as W
 
 from .core import UNITS, Document, Markup, Scale

@@ -6,7 +6,7 @@ import os
 import sys
 import time
 
-import fitz
+import pymupdf as fitz  # PyMuPDF
 from PyQt5 import QtCore, QtGui, QtWidgets as W
 
 from . import __version__
