@@ -90,6 +90,8 @@ class SheetOps:
         number = max(((s, t) for s, t, _ in spans if rx.fullmatch(t)), default=(0, None))[1]
         titles = [(s, t) for s, t, _ in spans if t != number and sum(c.isalpha() for c in t) >= 3 and not rx.fullmatch(t)]
         title = max(titles, default=(0, ""))[1]
+        if number and title.startswith(number):            # "A-101 Ground floor plan" -> "Ground floor plan"
+            title = title[len(number):].lstrip(" -\u2013\u2014:.\t")
         return number, title
 
     def sheet_info(self, pno: int, detect: bool = True) -> dict:

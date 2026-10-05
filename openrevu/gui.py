@@ -1178,7 +1178,7 @@ class Main(DocumentOps, W.QMainWindow):
                     self.meas_table.setItem(k, c, W.QTableWidgetItem(v))
         t.setSortingEnabled(True)
         if not getattr(self, "_mk_widths_set", False):
-            for col, width in enumerate((50, 140, 90, 90, 90, 260, 100)):
+            for col, width in enumerate((60, 140, 90, 90, 90, 260, 100)):
                 t.setColumnWidth(col, width)
             self._mk_widths_set = True
         self._rebuild_custom_fields()
@@ -1261,6 +1261,10 @@ class Main(DocumentOps, W.QMainWindow):
         if self.panel_name(self.left_tabs, self.left_tabs.currentIndex()) != "Sheets" or self.left_dock.isHidden():
             return
         t = self.sheets_table
+        if not getattr(self, "_sheets_widened", False):       # the table needs more room than the other panels
+            self._sheets_widened = True
+            if self.left_dock.width() < 390:
+                self.resizeDocks([self.left_dock], [400], QtCore.Qt.Horizontal)
         keep = set(self.sheets_selected_pages())
         t.blockSignals(True)
         t.setRowCount(0)
@@ -1274,12 +1278,22 @@ class Main(DocumentOps, W.QMainWindow):
                 it = W.QTableWidgetItem(v)
                 if c in (0, 4):
                     it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                if c in (1, 2, 3):
+                    it.setToolTip(v)                  # the full text, when the column is narrow
                 if c == 4 and info["revisions"]:
                     it.setToolTip("\n".join(f"{x['rev']}  {x['date']}  {x['description']}" for x in info["revisions"]))
                 t.setItem(i, c, it)
             if r["page"] - 1 in keep:  # selectRow would drop the earlier rows, so add each row to the selection
                 t.selectionModel().select(t.model().index(i, 0), QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
         t.blockSignals(False)
+        if not getattr(self, "_sheet_widths_set", False):
+            hh = t.horizontalHeader()
+            hh.setSectionResizeMode(W.QHeaderView.Interactive)
+            hh.setSectionResizeMode(2, W.QHeaderView.Stretch)    # the title takes the room that is left, so no scrolling
+            hh.setStretchLastSection(False)
+            for col, width in ((0, 40), (1, 66), (3, 96), (4, 40)):
+                t.setColumnWidth(col, width)
+            self._sheet_widths_set = True
 
     def sheets_selected_pages(self) -> list[int]:
         return sorted({int(self.sheets_table.item(i.row(), 0).text()) - 1 for i in self.sheets_table.selectedIndexes()})

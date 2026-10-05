@@ -233,3 +233,15 @@ def test_a_failure_halfway_restores_the_document(v1, tmp_path, monkeypatch):
         d.insert_pdf(other, pages=[0, 99])        # checked before the first page is inserted
     assert d.page_count == 3
     d.add_rect(0, fitz.Rect(60, 60, 90, 90)); assert len(d.markups()) == 2     # the document is still fully usable
+
+
+def test_title_does_not_repeat_the_sheet_number(tmp_path):
+    d = fitz.open(); p = d.new_page()
+    p.insert_text((400, 740), "A-101", fontsize=28)
+    p.insert_text((72, 90), "A-101 - Ground floor plan", fontsize=16)
+    p.insert_text((72, 130), "A-101: Ground floor plan", fontsize=12)
+    q = d.new_page(); q.insert_text((400, 740), "S-2", fontsize=28); q.insert_text((72, 90), "S-2", fontsize=16)
+    path = str(tmp_path / "t.pdf"); d.save(path)
+    doc = Document(path)
+    assert doc.sheet_info(0)["title"] == "Ground floor plan"
+    assert doc.sheet_info(1)["title"] == ""                  # nothing but the number: no title

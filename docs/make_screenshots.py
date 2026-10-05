@@ -75,6 +75,15 @@ def main():
         QtCore.QThread.msleep(20)
     w.grab().save(os.path.join(OUT, "main-window.png"))
 
+    # sheets panel with revisions
+    w.cv.select(None)
+    d.detect_sheets(); d.add_revision(0, "A", "Issued for review", date="2026-09-01"); d.add_revision(0, "B", "Walls moved", date="2026-10-02")
+    d.add_revision(1, "A", "Issued for review", date="2026-09-01"); d.set_sheet(0, discipline="Architecture"); d.set_sheet(1, discipline="Architecture")
+    d.set_sheet(2, discipline="Structure")
+    w.show_panel("Sheets"); w.show_panel("Measurements"); w.refresh_sheets()
+    for _ in range(10):
+        app.processEvents()
+    w.grab().save(os.path.join(OUT, "sheets-panel.png"))
     w.show_panel("Bookmarks"); w.show_panel("Tool Chest"); w.cv.select(None); w.cv.goto_page(1)
     for _ in range(10):
         app.processEvents()

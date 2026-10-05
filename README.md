@@ -221,6 +221,8 @@ The record is stored in the PDF, on the page. It stays with the page when you mo
   Sheets that are only in the new file are added at the end.
 - Make a bookmark for each sheet, and a link from each sheet reference (for example "see A-102") to its page.
 
+![The Sheets panel](docs/sheets-panel.png)
+
 The command `openrevu-cli sheets` makes the bookmarks and links in a batch.
 
 ### Pages

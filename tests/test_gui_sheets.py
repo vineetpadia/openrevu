@@ -138,3 +138,13 @@ def test_revision_on_several_selected_sheets_keeps_the_selection(win, monkeypatc
     w.add_revision_dialog()
     assert [w.doc.current_revision(i) for i in range(3)] == ["R1", "", "R1"]
     assert w.sheets_selected_pages() == [0, 2]
+
+
+def test_the_panel_is_widened_so_every_column_is_visible(app, tmp_path):
+    w = Main(make_set(tmp_path / "set.pdf", SET_V1)); w.resize(1400, 900); w.show(); app.processEvents()
+    w.show_panel("Sheets"); app.processEvents(); app.processEvents()
+    assert w.left_dock.width() >= 380
+    assert not w.sheets_table.horizontalScrollBar().isVisible()                    # every column fits, at this width
+    assert w.sheets_table.columnWidth(2) >= 80                                       # the title keeps a usable width
+    w.resizeDocks([w.left_dock], [230], QtCore.Qt.Horizontal); app.processEvents()
+    assert not w.sheets_table.horizontalScrollBar().isVisible()                    # and when the panel is narrow
