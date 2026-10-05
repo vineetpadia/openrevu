@@ -367,7 +367,7 @@ class Markup:
 class Document(PageOps):
 
     def __init__(self, path: str | None = None, password: str | None = None):
-        self.doc = fitz.open(path) if path else fitz.open()
+        self.doc = self._open(path) if path else fitz.open()
         encrypted = bool(self.doc.needs_pass)
         if encrypted and not (password and self.doc.authenticate(password)):
             raise PermissionError("password required or incorrect")
@@ -382,6 +382,12 @@ class Document(PageOps):
         self._redo: list[bytes] = []
         self.modified = False
         self.default_scale, self.page_scales = self._load_scales()
+
+    @staticmethod
+    def _open(path: str) -> fitz.Document:
+        """Open from memory so the file is never locked (Windows refuses to replace/overwrite open files)."""
+        with open(path, "rb") as f:
+            return fitz.open("pdf", f.read())
 
     def _page(self, pno: int) -> fitz.Page:
         """Page object kept alive (annotations returned by add_* are only valid while their page is)."""
@@ -907,7 +913,7 @@ class Document(PageOps):
             self._invalidate_pages()
             self.doc.close()
             os.replace(tmp, path)
-            self.doc = fitz.open(path)
+            self.doc = self._open(path)
             if self.doc.needs_pass and not self.doc.authenticate(self._password or kw.get("user_pw", "")):
                 raise PermissionError("saved file is encrypted; reopen with its password")
         else:

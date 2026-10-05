@@ -79,7 +79,7 @@ class PageOps:
 
     @mutates
     def insert_pdf(self, path, at=None, pages=None, password=None):
-        src = fitz.open(path)
+        src = self._open(path)
         if src.needs_pass and not src.authenticate(password or ""):
             raise PermissionError("source PDF is encrypted")
         at = len(self.doc) if at is None else at
@@ -91,6 +91,7 @@ class PageOps:
                 at += 1
         else:
             self.doc.insert_pdf(src, **kw)
+        src.close()
         self._remap_scales({i: i + (k if i >= kw["start_at"] else 0) for i in range(n)})
         return k
 
@@ -461,7 +462,8 @@ class PageOps:
 def compare_pdfs(old_path, new_path, out_path, dpi=100):
     """Overlay comparison: pixels only in old = red, only in new = blue, shared = grey.
     Returns [changed_fraction per page]; writes a PDF of the overlays."""
-    a, b = fitz.open(old_path), fitz.open(new_path)
+    from .core import Document
+    a, b = Document._open(old_path), Document._open(new_path)
     out, stats = fitz.open(), []
     for i in range(max(len(a), len(b))):
         pa = a[i].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY) if i < len(a) else None
@@ -495,4 +497,5 @@ def compare_pdfs(old_path, new_path, out_path, dpi=100):
         pg.insert_image(pg.rect, pixmap=pix)
         stats.append(changed / (w * h))
     out.save(out_path, garbage=3, deflate=True)
+    a.close(); b.close()
     return stats
