@@ -23,7 +23,7 @@ RECT_TYPES = {"Square", "Circle", "FreeText", "Text", "Stamp"}
 TEXT_MARKUP_TYPES = {"Highlight", "Underline", "StrikeOut", "Squiggly"}  # move-only (quad points)
 DEPTH_KEY = "OR_Depth"
 RECREATABLE_KINDS = {"Square", "Circle", "Line", "PolyLine", "Polygon", "Ink", "FreeText", "Text"}  # can be copied / saved as tools
-RESIZABLE_MEASURES = {"length", "perimeter", "area", "volume", "diameter"}
+RESIZABLE_MEASURES = {"length", "perimeter", "area", "volume", "diameter", "angle"}
 
 
 @dataclass
@@ -108,13 +108,38 @@ def cloud_points(rect: fitz.Rect, arc: float = 14.0, steps: int = 6):
     return pts
 
 
-def format_value(kind: str, val: float, unit: str) -> str:
-    """Human-readable measurement, e.g. 'area' 12.5 'ft' -> '12.50 ft²'."""
+STYLES = ("decimal", "feet-inches")
+FRACTIONS = (2, 4, 8, 16, 32, 64)
+
+
+def feet_inches(inches: float, denominator: int = 16) -> str:
+    """Architectural length, rounded to the nearest 1/denominator inch: 150.5 -> 12' 6 1/2\"."""
+    if denominator not in FRACTIONS:
+        raise ValueError(f"the fraction must be one of {FRACTIONS}")
+    sign = "-" if inches < 0 else ""
+    units = round(abs(inches) * denominator)            # whole number of 1/denominator inches
+    whole, frac = divmod(units, denominator)
+    feet, inch = divmod(whole, 12)
+    if frac:
+        g = math.gcd(frac, denominator)
+        inch_text = f"{inch} {frac // g}/{denominator // g}" if inch else f"{frac // g}/{denominator // g}"
+    else:
+        inch_text = str(inch)
+    if feet and not (inch or frac):
+        return f"{sign}{feet}'"
+    return f"{sign}{feet}' {inch_text}\"" if feet else f"{sign}{inch_text}\""
+
+
+def format_value(kind: str, val: float, unit: str, style: str = "decimal", denominator: int = 16) -> str:
+    """Human-readable measurement, e.g. 'area' 12.5 'ft' -> '12.50 ft²'.
+    With style='feet-inches', lengths in feet or inches read like 12' 6 1/2\"."""
     suffix = {"area": "²", "volume": "³"}.get(kind, "")
     if kind == "angle":
         return f"{val:.1f}°"
     if kind == "count":
         return f"{val:g} ea"
+    if style == "feet-inches" and kind in ("length", "perimeter", "diameter") and unit in ("ft", "in"):
+        return feet_inches(val * (12 if unit == "ft" else 1), denominator)
     return f"{val:.2f} {unit}{suffix}"
 
 
@@ -259,8 +284,9 @@ class Markup:
         """Resize to new_rect (visual coordinates). Measurements are re-measured."""
         self._check_transformable(resize=True)
         m = self.measurement()
-        if m and (m[0] not in RESIZABLE_MEASURES or any(c.subject == "Cutout" for c in self._children_markups())):
-            raise ValueError("this measurement cannot be resized; delete and re-measure it")
+        if m and m[0] not in RESIZABLE_MEASURES:
+            raise ValueError("a count marker has a fixed size; move it instead" if m[0] == "count"
+                             else "this measurement cannot be resized; delete it and measure again")
         old = self.annot.rect
         if old.width == 0 or old.height == 0:
             raise ValueError("degenerate markup")
@@ -294,17 +320,20 @@ class Markup:
                 center = pts[len(pts) // 2] if len(pts) > 2 else center
             elif kind == "perimeter":
                 val = sc.length(pts + pts[:1])
+            elif kind == "angle":
+                val, center = angle_deg(*pts), pts[1]
             else:
-                val = sc.area(pts)
+                cut = sum(sc.area(c.points()) for c in self._children_markups() if c.subject == "Cutout")
+                val = sc.area(pts) - cut
                 if kind == "volume":
                     val *= float(_xget(d.doc, self.xref, DEPTH_KEY) or 1)
         unit = self.measurement()[2]
         d.doc.xref_set_key(self.xref, MEASURE_KEY, f"({kind}:{val:.10g}:{unit})")
-        had_label = bool(self._children())
-        for c in self._children():
+        labels = [c for c in self._children() if c.info.get("subject") == "Label"]
+        for c in labels:
             self._page.delete_annot(c)
-        if had_label:
-            d._label(pno, center, format_value(kind, val, unit) if kind != "diameter" else f"Ø {val:.2f} {unit}", (0, 0.4, 1), self)
+        if labels:
+            d._label(pno, center, d.fmt(kind, val, unit) if kind != "diameter" else "Ø " + d.fmt(kind, val, unit), (0, 0.4, 1), self)
 
     def _apply(self, new_u: fitz.Rect, children=True):
         """Map the annotation's current (API-space) bbox onto new_u, scaling vertices accordingly."""
@@ -331,24 +360,36 @@ class Markup:
         raw = lambda pts: " ".join(f"{x + page.cropbox.x0:g} {page.mediabox.height - (y + page.cropbox.y0):g}"  # noqa: E731
                                    for x, y in pts)
         if self.kind in VERTEX_TYPES:
-            v = a.vertices
-            if self.kind == "Ink":
-                doc.xref_set_key(self.xref, "InkList", "[" + "".join("[" + raw([f(p) for p in st]) + "]" for st in v) + "]")
-            elif self.kind == "Line":
-                doc.xref_set_key(self.xref, "L", "[" + raw([f(p) for p in v]) + "]")
-            else:
-                doc.xref_set_key(self.xref, "Vertices", "[" + raw([f(p) for p in v]) + "]")
+            self._write_vertices(f)
         else:
             if self.kind in ("Square", "Circle"):  # annot.rect includes the /RD border padding; set_rect wants the inner rect
                 l, t, r_, b_ = self._rd()
                 new_u = fitz.Rect(new_u.x0 + l, new_u.y0 + t, new_u.x1 - r_, new_u.y1 - b_)
             a.set_rect(new_u)
         a.update()
-        if children and (sx, sy) == (1.0, 1.0):
+        if children:
             dxu, dyu = new_u.x0 - old.x0, new_u.y0 - old.y0  # translation is identical for padded and inner boxes
             for c in self._children():
                 m = Markup(c, self.page_no, page, self.d)
-                m._apply(fitz.Rect(c.rect.x0 + dxu, c.rect.y0 + dyu, c.rect.x1 + dxu, c.rect.y1 + dyu), children=False)
+                if m.kind == "Polygon" and m.subject == "Cutout":
+                    m._write_vertices(f)          # a cut-out follows its parent: same move and same scaling
+                elif (sx, sy) == (1.0, 1.0):
+                    m._apply(fitz.Rect(c.rect.x0 + dxu, c.rect.y0 + dyu, c.rect.x1 + dxu, c.rect.y1 + dyu), children=False)
+
+    def _write_vertices(self, f):
+        """Rewrite the geometry of a line, polyline, polygon, or pen markup with every point mapped through f
+        (f works in the annotation API space; see Document._tu)."""
+        a, page, doc = self.annot, self._page, self.d.doc
+        raw = lambda pts: " ".join(f"{x + page.cropbox.x0:g} {page.mediabox.height - (y + page.cropbox.y0):g}"  # noqa: E731
+                                   for x, y in pts)
+        v = a.vertices
+        if self.kind == "Ink":
+            doc.xref_set_key(self.xref, "InkList", "[" + "".join("[" + raw([f(p) for p in st]) + "]" for st in v) + "]")
+        elif self.kind == "Line":
+            doc.xref_set_key(self.xref, "L", "[" + raw([f(p) for p in v]) + "]")
+        else:
+            doc.xref_set_key(self.xref, "Vertices", "[" + raw([f(p) for p in v]) + "]")
+        a.update()
 
     @property
     def can_copy(self) -> bool:
@@ -385,6 +426,7 @@ class Document(SheetOps, PageOps):
         self.generation = 0
         self._pcache: dict[int, fitz.Page] = {}
         self.viewports: list = []
+        self.unit_style, self.fraction = "decimal", 16
         self._undo: list[bytes] = []
         self._redo: list[bytes] = []
         self.modified = False
@@ -481,6 +523,7 @@ class Document(SheetOps, PageOps):
                     d = json.loads(part.split("=", 1)[1])
                     self.viewports = [(int(v["page"]), fitz.Rect(v["rect"]), Scale.from_dict(v["scale"]))
                                       for v in d.get("viewports", [])]
+                    self.unit_style, self.fraction = d.get("style", "decimal"), int(d.get("fraction", 16))
                     return Scale.from_dict(d["default"]), {int(k): Scale.from_dict(v) for k, v in d["pages"].items()}
                 except (ValueError, KeyError, TypeError):
                     pass
@@ -490,7 +533,8 @@ class Document(SheetOps, PageOps):
         md = dict(self.doc.metadata or {})
         kw = [p for p in (md.get("keywords") or "").split(";") if p and not p.startswith(TAG + "-scale")]
         blob = {"default": self.default_scale.to_dict(), "pages": {str(k): v.to_dict() for k, v in self.page_scales.items()},
-                "viewports": [{"page": p, "rect": list(r), "scale": sc.to_dict()} for p, r, sc in self.viewports]}
+                "viewports": [{"page": p, "rect": list(r), "scale": sc.to_dict()} for p, r, sc in self.viewports],
+                "style": self.unit_style, "fraction": self.fraction}
         kw.append(f"{TAG}-scales={json.dumps(blob)}")
         md["keywords"] = ";".join(kw)
         self.doc.set_metadata(md)
@@ -501,6 +545,26 @@ class Document(SheetOps, PageOps):
 
     def scale_for(self, pno: int) -> Scale:
         return self.page_scales.get(pno, self.default_scale)
+
+    def fmt(self, kind: str, val: float, unit: str) -> str:
+        """Format a measurement with this document's unit style."""
+        return format_value(kind, val, unit, self.unit_style, self.fraction)
+
+    @_mutates
+    def set_unit_style(self, style: str = "decimal", fraction: int = 16) -> int:
+        """Choose how lengths in feet or inches are shown. Existing labels are redrawn. Returns the number redrawn."""
+        if style not in STYLES:
+            raise ValueError(f"style must be one of {STYLES}")
+        if fraction not in FRACTIONS:
+            raise ValueError(f"the fraction must be one of {FRACTIONS}")
+        self.unit_style, self.fraction = style, fraction
+        n = 0
+        for m in self.markups():
+            r = m.measurement()
+            if r and r[0] != "count" and any(c.info.get("subject") == "Label" for c in m._children()):
+                m._remeasure(r[0])
+                n += 1
+        return n
 
     def scale_at(self, pno: int, pts) -> Scale:
         """Scale that applies at the centroid of pts: the innermost-last viewport containing it, else the page scale."""
@@ -730,7 +794,7 @@ class Document(SheetOps, PageOps):
         self._finish(a, color, 1.5, subject, measure=f"length:{v:.10g}:{sc.unit}")
         if label:
             mid = pts[len(pts) // 2] if len(pts) > 2 else self._centroid(pts)
-            self._label(pno, mid, f"{v:.2f} {sc.unit}", color, a)
+            self._label(pno, mid, self.fmt("length", v, sc.unit), color, a)
         return a, v
 
     @_mutates
@@ -741,7 +805,7 @@ class Document(SheetOps, PageOps):
         a = self._page(pno).add_polygon_annot(self._tus(pno, pts))
         self._finish(a, color, 1.5, subject, measure=f"perimeter:{v:.10g}:{sc.unit}")
         if label:
-            self._label(pno, self._centroid(pts), f"{v:.2f} {sc.unit}", color, a)
+            self._label(pno, self._centroid(pts), self.fmt("perimeter", v, sc.unit), color, a)
         return a, v
 
     @_mutates
@@ -819,7 +883,7 @@ class Document(SheetOps, PageOps):
         a = self._page(pno).add_circle_annot(self._ru(pno, fitz.Rect(c[0] - rad, c[1] - rad, c[0] + rad, c[1] + rad)))
         self._finish(a, color, 1.5, subject, measure=f"diameter:{v:.10g}:{sc.unit}")
         if label:
-            self._label(pno, c, f"Ø {v:.2f} {sc.unit}", color, a)
+            self._label(pno, c, "Ø " + self.fmt("diameter", v, sc.unit), color, a)
         return a, v
 
     @_mutates

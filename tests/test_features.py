@@ -685,17 +685,52 @@ def test_resizing_measurements_remeasures(pdf):
     assert len(d.markups()) == 5 and len(d.markups(include_children=True)) == 10  # labels re-created, no leaks
     labels = {x.comment for x in d.markups(include_children=True) if x.subject == "Label"}
     assert any(l.startswith("20.0") or "20.0" in l or "20.00" in l for l in labels)
-    for kind in ("count",):
-        d.add_count(0, (5, 5))
-        c = [m for m in d.markups() if m.measurement() and m.measurement()[0] == kind][0]
-        with pytest.raises(ValueError):
-            c.resize(fitz.Rect(0, 0, 30, 30))
-    d.add_angle(0, (10, 0), (0, 0), (0, 10))
-    with pytest.raises(ValueError):
-        [m for m in d.markups() if m.measurement()[0] == "angle"][0].resize(fitz.Rect(0, 0, 30, 30))
-    d.add_area(0, [(0, 0), (100, 0), (100, 100), (0, 100)], cutouts=[[(10, 10), (30, 10), (30, 30), (10, 30)]])
-    with pytest.raises(ValueError, match="cannot be resized"):
-        [m for m in d.markups() if m.subject == "Area"][-1].resize(fitz.Rect(0, 0, 300, 300))
+    d.add_count(0, (5, 5))
+    c = [m for m in d.markups() if m.measurement() and m.measurement()[0] == "count"][0]
+    with pytest.raises(ValueError, match="fixed size"):
+        c.resize(fitz.Rect(0, 0, 30, 30))
+
+
+def test_resizing_an_area_with_cutouts_scales_the_cutouts_too(pdf):
+    d = Document(pdf)
+    d.set_scale(Scale("m", 0.1))
+    outer = [(100, 100), (300, 100), (300, 300), (100, 300)]           # 200 x 200 pt = 400 m2
+    hole = [(150, 150), (200, 150), (200, 200), (150, 200)]            # 50 x 50 pt = 25 m2
+    d.add_area(0, outer, cutouts=[hole])
+    m = [x for x in d.markups() if x.subject == "Area"][0]
+    assert m.measurement()[1] == pytest.approx(375.0)                  # (40000 - 2500) pt2 * 0.01 m2/pt2
+    r = m.rect
+    m.resize(fitz.Rect(r.x0, r.y0, r.x0 + (r.width - 3) * 2 + 3, r.y0 + (r.height - 3) * 2 + 3))
+    m = [x for x in d.markups() if x.subject == "Area"][0]
+    cuts = [c for c in m._children_markups() if c.subject == "Cutout"]
+    assert len(cuts) == 1                                              # the cut-out survived the re-measure
+    assert cuts[0].rect.width == pytest.approx(2 * 50, abs=6)          # and was scaled with its parent
+    assert m.measurement()[1] == pytest.approx(4 * 375.0, rel=0.06)
+    labels = [c for c in m._children_markups() if c.subject == "Label"]
+    assert len(labels) == 1
+    m.move(20, 30)                                                     # moving still drags the cut-out along
+    cut = [c for c in [x for x in d.markups() if x.subject == "Area"][0]._children_markups() if c.subject == "Cutout"][0]
+    assert cut.rect.x0 > 150 + 15
+
+
+def test_resizing_an_angle_remeasures_it(pdf):
+    d = Document(pdf)
+    d.add_angle(0, (100, 0 + 100), (100, 200), (200, 200))             # a right angle at the vertex (100, 200)
+    m = d.markups()[0]
+    assert m.measurement()[1] == pytest.approx(90)
+    r = m.rect
+    m.resize(fitz.Rect(r.x0, r.y0, r.x0 + (r.width - 3) * 3 + 3, r.y0 + (r.height - 3) * 1 + 3))   # stretch sideways
+    m = d.markups()[0]
+    pts = m.points()
+    from openrevu.core import angle_deg
+    assert m.measurement()[1] == pytest.approx(angle_deg(*pts), abs=0.01) and m.measurement()[1] == pytest.approx(90)
+    # a skewed angle changes its value when the shape is stretched in one direction only
+    d2 = Document(pdf)
+    d2.add_angle(0, (100, 100), (200, 200), (300, 100))               # 90 degrees, apex at the bottom
+    m2 = d2.markups()[0]; r2 = m2.rect
+    m2.resize(fitz.Rect(r2.x0, r2.y0, r2.x0 + (r2.width - 3) * 2 + 3, r2.y0 + (r2.height - 3) + 3))
+    after = d2.markups()[0].measurement()[1]
+    assert after == pytest.approx(angle_deg(*d2.markups()[0].points()), abs=0.01) and after > 100   # opened up
 
 
 def room_pdf(path, rotation=0):
@@ -970,3 +1005,61 @@ def test_cli_run_script(pdf, tmp_path):
     assert main(["run", pdf, out, str(tmp_path / "bad.py")]) == 1
     (tmp_path / "syn.py").write_text("def (\n")
     assert main(["run", pdf, out, str(tmp_path / "syn.py")]) == 1
+
+
+# ---------- architectural units ----------
+@pytest.mark.parametrize("inches,expected", [
+    (150.5, "12' 6 1/2\""), (144, "12'"), (6.5, "6 1/2\""), (0, "0\""), (0.0625, "1/16\""), (11.99, "1'"),
+    (143.99, "12'"), (-30.25, "-2' 6 1/4\""), (12.03, "1'"), (13, "1' 1\""), (35.9, "2' 11 7/8\""),
+])
+def test_feet_inches_formatting(inches, expected):
+    from openrevu.core import feet_inches
+    assert feet_inches(inches) == expected
+
+
+def test_feet_inches_fractions_and_errors():
+    from openrevu.core import feet_inches
+    assert feet_inches(6.3, 2) == "6 1/2\"" and feet_inches(6.3, 64) == "6 19/64\"" and feet_inches(6.01, 4) == "6\""
+    with pytest.raises(ValueError):
+        feet_inches(1, 10)
+    assert format_value("length", 12.5, "ft", "feet-inches") == "12' 6\""
+    assert format_value("length", 6.25, "in", "feet-inches") == "6 1/4\""
+    assert format_value("area", 12.5, "ft", "feet-inches") == "12.50 ft²"        # only lengths change
+    assert format_value("length", 12.5, "m", "feet-inches") == "12.50 m"          # metric is untouched
+    assert format_value("angle", 90, "deg", "feet-inches") == "90.0°"
+
+
+def test_unit_style_changes_labels_and_persists(pdf, tmp_path):
+    d = Document(pdf)
+    d.set_scale(Scale("ft", 1 / 12))                         # 1 pt = 1 inch
+    d.add_length(0, [(0, 100), (150.5, 100)]); d.add_perimeter(0, [(0, 200), (24, 200), (24, 236)], label=True)
+    d.add_area(0, [(0, 300), (12, 300), (12, 312)])
+    labels = lambda: sorted(x.comment for x in d.markups(include_children=True) if x.subject == "Label")  # noqa: E731
+    assert "12.54 ft" in labels()
+    assert d.set_unit_style("feet-inches", 16) == 3          # length, perimeter, area labels were redrawn
+    assert "12' 6 1/2\"" in labels() and any("ft²" in l for l in labels())      # the area keeps decimals
+    assert d.fmt("length", 12.5, "ft") == "12' 6\""
+    d.add_length(0, [(0, 400), (12, 400)])                   # new labels follow the style
+    assert "1'" in labels()
+    out = str(tmp_path / "s.pdf"); d.save(out)
+    r = Document(out)
+    assert r.unit_style == "feet-inches" and r.fraction == 16 and r.fmt("length", 3, "ft") == "3'"
+    d.undo()
+    assert d.unit_style == "feet-inches"                      # undo of the last length keeps the style
+    d.set_unit_style("decimal")
+    assert "12.54 ft" in labels()
+    with pytest.raises(ValueError):
+        d.set_unit_style("roman")
+    with pytest.raises(ValueError):
+        d.set_unit_style("feet-inches", 10)
+    assert d.unit_style == "decimal"                          # a rejected change leaves the style alone
+
+
+def test_unit_style_survives_undo_of_the_style_change(pdf):
+    d = Document(pdf)
+    d.set_unit_style("feet-inches", 8)
+    assert (d.unit_style, d.fraction) == ("feet-inches", 8)
+    d.undo()
+    assert (d.unit_style, d.fraction) == ("decimal", 16)
+    d.redo()
+    assert (d.unit_style, d.fraction) == ("feet-inches", 8)

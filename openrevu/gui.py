@@ -10,7 +10,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets as W
 
 from . import __version__
 from .canvas import Canvas
-from .core import STATUSES, Document, format_value
+from .core import STATUSES, Document
 from .gui_ops import ERRORS, DocumentOps, parse_pages  # noqa: F401  (parse_pages re-exported)
 from .icons import tool_icon
 from .toolchest import ToolChest
@@ -533,6 +533,8 @@ class Main(DocumentOps, W.QMainWindow):
         self._act(m, "Calibrate scale (drag a known length)", lambda: self.set_tool("Calibrate"))
         self._act(m, "Set scale by ratio…", self.scale_ratio)
         self._act(m, "Add viewport scale (drag a region)", lambda: self.set_tool("Viewport"))
+        self.act_arch = self._act(m, "Show feet and inches (12' 6 1/2\")", self.toggle_arch_units)
+        self.act_arch.setCheckable(True)
         self._act(m, "Show scales", self.show_scales)
         self._act(m, "Measurement summary…", self.show_summary)
 
@@ -955,6 +957,14 @@ class Main(DocumentOps, W.QMainWindow):
         if cv and cv.tool not in PERSISTENT_TOOLS and not self.act_keep.isChecked():
             self.set_tool("Select", announce=False)
 
+    def toggle_arch_units(self):
+        if not self._need_doc():
+            return self.act_arch.setChecked(False)
+        style = "feet-inches" if self.act_arch.isChecked() else "decimal"
+        if self._run(self.doc.set_unit_style, style, self.doc.fraction) is not None:
+            self.refresh_markups()
+            self.statusBar().showMessage("Lengths in feet and inches." if style == "feet-inches" else "Decimal lengths.")
+
     def _selected(self):
         return self.cv.selected if self.cv else None
 
@@ -1000,6 +1010,8 @@ class Main(DocumentOps, W.QMainWindow):
         self.refresh_all()
 
     def _after_change(self):
+        if self.doc:
+            self.act_arch.setChecked(self.doc.unit_style == "feet-inches")  # undo and redo can change the style
         self.refresh_sheets()
         self.refresh_markups()
         self._load_props()
@@ -1020,6 +1032,7 @@ class Main(DocumentOps, W.QMainWindow):
         self._load_props()
         self._update_status_widgets()
         d = self.doc
+        self.act_arch.setChecked(bool(d) and d.unit_style == "feet-inches")
         self.setWindowTitle(f"OpenRevu — {d.path}" if d and d.path else "OpenRevu")
 
     def refresh_markups(self):
@@ -1036,7 +1049,7 @@ class Main(DocumentOps, W.QMainWindow):
                 if st and STATUSES[st - 1] != status:
                     continue
                 r = m.measurement()
-                val = format_value(*r) if r else ""
+                val = d.fmt(*r) if r else ""
                 row = [str(m.page_no + 1), m.subject, m.kind, m.author, status, m.comment, val]
                 if q and q not in " ".join(row).lower():
                     continue
@@ -1051,11 +1064,11 @@ class Main(DocumentOps, W.QMainWindow):
                 self._rows.append(m)
             for k, ((subj, kind, unit), (n, tot)) in enumerate(sorted(d.takeoff_by_subject().items())):
                 self.meas_table.insertRow(k)
-                for c, v in enumerate((subj, str(n), format_value(kind, tot, unit).split(" ")[0], {"area": f"{unit}²", "volume": f"{unit}³"}.get(kind, unit))):
+                for c, v in enumerate((subj, str(n), d.fmt(kind, tot, unit).split(" ")[0], {"area": f"{unit}²", "volume": f"{unit}³"}.get(kind, unit))):
                     self.meas_table.setItem(k, c, W.QTableWidgetItem(v))
         t.setSortingEnabled(True)
         if d:
-            lines = [f"{k.title()}: {format_value(k, v, u)}" for (k, u), v in sorted(d.takeoff().items())]
+            lines = [f"{k.title()}: {d.fmt(k, v, u)}" for (k, u), v in sorted(d.takeoff().items())]
             self.totals.setText("Totals — " + ("; ".join(lines) if lines else "no measurements yet"))
         else:
             self.totals.setText("")
@@ -1212,7 +1225,7 @@ class Main(DocumentOps, W.QMainWindow):
         self.p_replies.clear()
         if m is not None:
             try:
-                self.p_info.setText(f"{m.kind} on page {m.page_no + 1}" + (f"\n{format_value(*m.measurement())}" if m.measurement() else ""))
+                self.p_info.setText(f"{m.kind} on page {m.page_no + 1}" + (f"\n{self.doc.fmt(*m.measurement())}" if m.measurement() else ""))
                 self.p_subject.setText(m.subject)
                 self.p_comment.setPlainText(m.comment)
                 self.p_status.setCurrentIndex(STATUSES.index(m.status) if m.status in STATUSES else 0)

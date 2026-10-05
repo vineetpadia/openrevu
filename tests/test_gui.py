@@ -383,3 +383,16 @@ def test_pan_tool_drags_the_view(win):
     assert w.cv.verticalScrollBar().value() == 100
     assert w.doc.markups() == []
     assert w.cv.viewport().cursor().shape() == QtCore.Qt.OpenHandCursor
+
+
+def test_feet_inches_menu_toggle_redraws_labels_and_shows_in_the_list(win):
+    from openrevu.core import Scale
+    w = win
+    w.doc.set_scale(Scale("ft", 1 / 12))
+    w.doc.add_length(0, [(10, 100), (160.5, 100)]); w._after_change()
+    assert "12.54 ft" in w.mk_table.item(0, 6).text()
+    w.act_arch.setChecked(True); w.toggle_arch_units()
+    assert w.doc.unit_style == "feet-inches" and "12' 6 1/2\"" in w.mk_table.item(0, 6).text()
+    assert "12' 6 1/2\"" in w.totals.text()
+    w.undo()
+    assert w.doc.unit_style == "decimal" and not w.act_arch.isChecked()      # the menu follows the document
