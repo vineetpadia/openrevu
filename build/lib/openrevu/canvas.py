@@ -9,7 +9,7 @@ from .core import UNITS, Document, Markup, Scale
 GAP = 14
 DRAG_TOOLS = {"Rectangle", "Ellipse", "Line", "Arrow", "Cloud", "Highlight", "Underline", "Strikeout",
               "Squiggly", "Calibrate", "Text", "Callout", "Redact", "RectArea", "EllipseArea", "Diameter",
-              "Stamp", "Signature", "Viewport"}
+              "Stamp", "Signature", "Viewport", "Snapshot", "Image", "Link", "CopyText"}
 POLY_TOOLS = {"Length", "Area", "Perimeter", "Volume", "Polyline"}
 ANGLE_TOOLS = {"Angle"}
 ALL_TOOLS = ["Select", "Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Cloud", "Pen", "Highlight",
@@ -101,9 +101,12 @@ class Canvas(W.QGraphicsView):
                 self._render_page(i)
 
     def _render_page(self, i):
-        pix = self.doc.render(i, self.zoom)
+        dpr = max(1.0, self.devicePixelRatioF())          # on a high-DPI screen render more pixels, so the page is sharp
+        pix = self.doc.render(i, self.zoom * dpr)
         img = QtGui.QImage(pix.samples, pix.width, pix.height, pix.stride, QtGui.QImage.Format_RGB888)
-        item = self.scene().addPixmap(QtGui.QPixmap.fromImage(img.copy()))
+        qpix = QtGui.QPixmap.fromImage(img.copy())
+        qpix.setDevicePixelRatio(dpr)                     # the logical size stays the same, so all coordinates are unchanged
+        item = self.scene().addPixmap(qpix)
         item.setPos(self._rects[i].topLeft())
         item.setZValue(1)
         self._pix[i] = item
@@ -246,6 +249,7 @@ class Canvas(W.QGraphicsView):
         pno = self.page_at(sp)
         if self.tool == "Pan":
             self._mode, self._last = "pan", ev.pos()
+            self._click = (ev.pos(), pno, self._to_pdf(pno, sp) if pno is not None else None)
             self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
             return
         if pno is None:
@@ -255,10 +259,6 @@ class Canvas(W.QGraphicsView):
             self.tool_chest_item(pno, pt)
             return
         t = self.tool
-        if t == "Pan":
-            self._mode, self._last = "pan", ev.pos()
-            self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
-            return
         if t == "Select":
             return self._press_select(ev, pno, pt, sp)
         if self._pg is not None and self._pg != pno and (self._pts or self._start):
@@ -301,6 +301,7 @@ class Canvas(W.QGraphicsView):
             self._mode, self._start, self._pg = "move", pt, pno
         else:
             self._mode, self._last = "pan", ev.pos()
+            self._click = (ev.pos(), pno, pt)
 
     def mouseMoveEvent(self, ev):
         if self._mode == "pan":
@@ -365,6 +366,9 @@ class Canvas(W.QGraphicsView):
         if mode == "pan":
             if self.tool == "Pan":
                 self.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+            click, self._click = getattr(self, "_click", None), None
+            if click and click[1] is not None and (ev.pos() - click[0]).manhattanLength() <= 4 and self.tool in ("Select", "Pan"):
+                self._follow_link(click[1], click[2])     # a click that did not drag
             return
         sp = self.mapToScene(ev.pos())
         if mode in ("move", "resize") and self.selected is not None:
@@ -391,7 +395,7 @@ class Canvas(W.QGraphicsView):
         a, b = self._start, self._to_pdf(self._pg, sp)
         pts, pno, self._start, self._pts = self._pts, self._pg, None, []
         self._clear_overlay()
-        if abs(a[0] - b[0]) + abs(a[1] - b[1]) < 3 and self.tool not in ("Stamp", "Signature"):
+        if abs(a[0] - b[0]) + abs(a[1] - b[1]) < 3 and self.tool not in ("Stamp", "Signature", "Image"):
             return self.invalidate([pno])
         self._commit_drag(pno, a, b, pts)
         self._pg = None
@@ -438,6 +442,36 @@ class Canvas(W.QGraphicsView):
         elif t == "RectArea": _, v = d.add_rect_area(pno, r); self.status.emit(f"Area: {v:.3f}")
         elif t == "EllipseArea": _, v = d.add_ellipse_area(pno, r); self.status.emit(f"Area: {v:.3f}")
         elif t == "Diameter": _, v = d.add_diameter(pno, a, b); self.status.emit(f"Diameter: {v:.3f}")
+        elif t == "Snapshot":
+            pix = d.render(pno, 2.0, clip=r)
+            img = QtGui.QImage(pix.samples, pix.width, pix.height, pix.stride, QtGui.QImage.Format_RGB888).copy()
+            W.QApplication.clipboard().setImage(img)
+            self.status.emit(f"Snapshot copied to the clipboard ({img.width()} x {img.height()} px). Paste it into another program.")
+            return self.invalidate([pno])
+        elif t == "CopyText":
+            text = d._page(pno).get_text("text", clip=d._ru(pno, r), sort=True).strip()
+            if not text:
+                self.status.emit("There is no text in that region. A scanned page needs OCR first (Document > OCR).")
+            else:
+                W.QApplication.clipboard().setText(text)
+                self.status.emit(f"Copied {len(text)} characters to the clipboard.")
+            return self.invalidate([pno])
+        elif t == "Image":
+            path, _ = W.QFileDialog.getOpenFileName(self, "Choose an image", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)")
+            if not path:
+                return self.invalidate([pno])
+            try:
+                if r.width < 20:   # a click: keep the picture's own proportions
+                    pm = fitz.Pixmap(path)
+                    w0 = min(200.0, pm.width)
+                    r = fitz.Rect(a[0], a[1], a[0] + w0, a[1] + w0 * pm.height / pm.width)
+                d.add_image_stamp(pno, r, path)
+            except Exception as e:  # the image libraries raise many different types for a bad file
+                self.status.emit(f"Cannot use that image: {e}")
+                return self.invalidate([pno])
+        elif t == "Link":
+            self._add_link(pno, r)
+            return self._done([pno])
         elif t == "Calibrate":
             self._calibrate(pno, a, b)
             return self._done(None)
@@ -462,6 +496,50 @@ class Canvas(W.QGraphicsView):
         except ValueError as e:
             self.status.emit(str(e))
         self._done([pno])
+
+    def _follow_link(self, pno, pt):
+        """Follow the link under the point: a page link goes to the page, a web link opens in the browser."""
+        try:
+            links = self.doc.links(pno)
+        except Exception:
+            return
+        p = self.doc._tu(pno, pt)
+        for l in links:
+            if not fitz.Rect(l["from"]).contains(p):
+                continue
+            if l["kind"] == fitz.LINK_GOTO and 0 <= l.get("page", -1) < self.doc.page_count:
+                self.goto_page(l["page"])
+                self.status.emit(f"Went to page {l['page'] + 1}.")
+            elif l["kind"] == fitz.LINK_URI:
+                uri = l.get("uri", "")
+                if uri.lower().startswith(("http://", "https://", "mailto:")):
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl(uri))
+                    self.status.emit(f"Opened {uri}")
+                else:   # a PDF can hold file: or javascript: links; they are never opened from here
+                    self.status.emit(f"Did not open the link {uri!r}: only page, web, and e-mail links are followed.")
+            else:       # launch links (a file or a program), named destinations, and anything else
+                target = l.get("file") or l.get("name") or "this target"
+                self.status.emit(f"Did not open the link ({target}): only page, web, and e-mail links are followed.")
+            return
+
+    def _add_link(self, pno, r):
+        """Ask for a web address or a page number, and make the dragged region a link."""
+        text, ok = W.QInputDialog.getText(self, "Link", "Web address (https://…) or page number:")
+        text = text.strip()
+        if not ok or not text:
+            return
+        if text.isdigit():
+            n = int(text)
+            if not 1 <= n <= self.doc.page_count:
+                return self.status.emit(f"There is no page {n}. The document has {self.doc.page_count} page(s).")
+            self.doc.add_link_goto(pno, r, n - 1)
+            return self.status.emit(f"Link to page {n} added. Click it in a PDF viewer to follow it.")
+        if text.lower().startswith("www."):
+            text = "https://" + text
+        if not text.lower().startswith(("http://", "https://", "mailto:")):
+            return self.status.emit("A link needs a page number or an address that starts with http://, https://, or mailto:")
+        self.doc.add_link_uri(pno, r, text)
+        self.status.emit(f"Link to {text} added.")
 
     def _calibrate(self, pno, a, b):
         ln, ok = W.QInputDialog.getDouble(self, "Calibrate", "Real length of the dragged segment:", 10, 1e-6, 1e9, 3)

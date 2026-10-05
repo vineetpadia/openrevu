@@ -29,6 +29,21 @@ class ToolChest:
         x0, y0 = d["rect"][0], d["rect"][1]
         return doc.add_from_dict(pno, d, offset=(at[0] - x0, at[1] - y0))
 
+    def import_btx(self, path: str):
+        """Add the tools of a Bluebeam tool set (.btx). Returns an ImportResult. See openrevu.btx for what is supported."""
+        from .btx import ImportResult, read_btx
+        title, tools, skipped = read_btx(path)
+        res = ImportResult(title=title, skipped=skipped)
+        for name, tool in tools:
+            final, n = name, 2
+            while final in self.items:
+                final, n = f"{name} ({n})", n + 1
+            self.items[final] = tool
+            res.imported.append(final)
+        if res.imported:
+            self.save()
+        return res
+
     def save(self) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w") as f:

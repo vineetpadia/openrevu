@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import fitz
 from PyQt5 import QtCore, QtGui, QtWidgets as W
 
 from . import __version__
 from .canvas import Canvas
-from .core import STATUSES, Document, format_value
+from .core import STATUSES, Document
 from .gui_ops import ERRORS, DocumentOps, parse_pages  # noqa: F401  (parse_pages re-exported)
 from .icons import tool_icon
+from . import recovery
 from .toolchest import ToolChest
 
 # tool groups shown as drop-down buttons (each remembers the last tool you used)
@@ -20,10 +22,11 @@ TOOL_GROUPS = {
     "Shapes": ["Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Cloud", "Pen"],
     "Text & Review": ["Text", "Callout", "Note", "Highlight", "Underline", "Strikeout", "Squiggly"],
     "Stamp & Sign": ["Stamp", "Signature", "Redact"],
+    "Insert": ["Image", "Snapshot", "CopyText", "Link"],
     "Measure": ["Calibrate", "Length", "Perimeter", "Area", "Fill", "RectArea", "EllipseArea", "Volume",
                 "Diameter", "Angle", "Count", "Viewport"],
 }
-LABELS = {"RectArea": "Rectangle area", "EllipseArea": "Ellipse area", "Fill": "Fill (room area)",
+LABELS = {"CopyText": "Copy text", "RectArea": "Rectangle area", "EllipseArea": "Ellipse area", "Fill": "Fill (room area)",
           "Calibrate": "Calibrate scale", "Length": "Length", "Viewport": "Viewport scale"}
 SHORTCUTS = {"Select": "V", "Pan": "H", "Rectangle": "R", "Ellipse": "E", "Line": "L", "Arrow": "A",
              "Polyline": "Y", "Cloud": "C", "Pen": "P", "Text": "T", "Callout": "O", "Note": "N",
@@ -44,6 +47,10 @@ TOOL_HINTS = {
     "Fill": "Click inside a closed room. Columns are subtracted.",
     "Viewport": "Drag a region that has its own scale, then enter the ratio (paper inches : real length : unit).",
     "Stamp": "Click or drag on the page to place the stamp.",
+    "Image": "Click or drag on the page. You choose the picture next.",
+    "Snapshot": "Drag a region. OpenRevu copies it to the clipboard as a picture.",
+    "Link": "Drag a region. Then enter a web address or a page number.",
+    "CopyText": "Drag over text. OpenRevu copies it to the clipboard.",
     "Redact": "Drag an area. Then use Document > Apply redactions to remove the content.",
     "Count": "Click each item to count. Set the group name in the toolbar.",
 }
@@ -150,12 +157,12 @@ class StartPage(W.QWidget):
 
 
 class Main(DocumentOps, W.QMainWindow):
-    def __init__(self, path=None):
+    def __init__(self, path=None, prefs=None):
         super().__init__()
         self.setWindowTitle("OpenRevu")
         self.resize(1480, 920)
         self.setStyleSheet(STYLE)
-        self.prefs = Prefs()
+        self.prefs = prefs or Prefs()
         self.clipboard: dict | None = None
         self.chest = ToolChest()
         self.color = (1.0, 0.0, 0.0)
@@ -185,6 +192,10 @@ class Main(DocumentOps, W.QMainWindow):
             self.restoreState(s)
         self._sync_central()
         self.statusBar().showMessage("Open a PDF to begin (Ctrl+O)")
+        self._autosave_rev: dict = {}           # document id -> the revision that was last written
+        self.autosave_timer = QtCore.QTimer(self)
+        self.autosave_timer.timeout.connect(self.autosave_now)
+        self.autosave_timer.start(int(float(os.environ.get("OPENREVU_AUTOSAVE_SECONDS", "60")) * 1000))
         if path:
             self.open(path)
 
@@ -197,6 +208,72 @@ class Main(DocumentOps, W.QMainWindow):
     @property
     def doc(self) -> Document | None:
         return self.cv.doc if self.cv else None
+
+    def autosave_now(self) -> int:
+        """Write a snapshot of every document with unsaved changes. Returns how many were written."""
+        n = 0
+        for i in range(self.tabs.count()):
+            cv = self.tabs.widget(i)
+            if not isinstance(cv, Canvas):
+                continue
+            d = cv.doc
+            if not d.modified or self._autosave_rev.get(d.recovery_id) == d.revision:
+                continue
+            try:
+                recovery.write(d.recovery_id, d._snapshot(), d.path, self.tabs.tabText(i).lstrip("*"), bool(d._password))
+                self._autosave_rev[d.recovery_id] = d.revision
+                n += 1
+            except OSError as e:     # a full disk must not interrupt the user's work
+                self.statusBar().showMessage(f"Autosave failed: {e}")
+        return n
+
+    def offer_recovery(self) -> int:
+        """After a crash: offer to restore the documents that had unsaved changes. Returns how many were restored."""
+        found = recovery.entries()
+        if not found:
+            return 0
+        names = "\n".join(f"  {m['title']}  ({time.strftime('%Y-%m-%d %H:%M', time.localtime(m['time']))})" for m in found)
+        box = W.QMessageBox(self)
+        box.setWindowTitle("Recover unsaved work")
+        box.setIcon(W.QMessageBox.Question)
+        box.setText(f"OpenRevu closed unexpectedly last time. It saved {len(found)} document(s) with unsaved changes:\n{names}")
+        restore = box.addButton("Recover", W.QMessageBox.AcceptRole)
+        discard = box.addButton("Discard", W.QMessageBox.DestructiveRole)
+        box.addButton("Ask me later", W.QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is discard:
+            for m in found:
+                recovery.remove(m["id"])
+            return 0
+        if box.clickedButton() is not restore:
+            return 0
+        n = 0
+        for m in found:
+            pw = None
+            while True:
+                try:
+                    d = Document(m["file"], pw)
+                    break
+                except PermissionError:
+                    pw, ok = W.QInputDialog.getText(self, "Password", f"Password for {m['title']}:", W.QLineEdit.Password)
+                    if not ok:
+                        d = None
+                        break
+                except Exception as e:   # damaged snapshot
+                    W.QMessageBox.warning(self, "Recover", f"{m['title']} could not be recovered: {e}")
+                    recovery.remove(m["id"])
+                    d = None
+                    break
+            if d is None:
+                continue
+            d.path = None                  # saving asks for a file name: never overwrite the snapshot or the original silently
+            d.suggested_path = m.get("path")
+            d.modified = True
+            self._attach(d, f"{m['title']} (recovered)")
+            self.tabs.setTabText(self.tabs.currentIndex(), self._title())
+            recovery.remove(m["id"])
+            n += 1
+        return n
 
     def _need_doc(self) -> bool:
         if not self.cv:
@@ -313,6 +390,33 @@ class Main(DocumentOps, W.QMainWindow):
         ll.addWidget(W.QLabel("Tick a layer to show it."))
         ll.addWidget(self.layer_list)
         self._add_panel(self.left_tabs, lw, "Layers", "layers")
+        shw = W.QWidget()
+        shl = W.QVBoxLayout(shw)
+        self.sheets_table = W.QTableWidget(0, 5)
+        self.sheets_table.setHorizontalHeaderLabels(["Page", "Sheet", "Title", "Discipline", "Rev"])
+        self.sheets_table.verticalHeader().hide()
+        self.sheets_table.horizontalHeader().setStretchLastSection(True)
+        self.sheets_table.setSelectionBehavior(W.QAbstractItemView.SelectRows)
+        self.sheets_table.setSelectionMode(W.QAbstractItemView.ExtendedSelection)
+        self.sheets_table.setToolTip("Double-click Sheet, Title, or Discipline to edit. Click a row to go to the page.")
+        self.sheets_table.itemChanged.connect(self._sheet_edited)
+        self.sheets_table.itemSelectionChanged.connect(self._sheet_selected)
+        shl.addWidget(self.sheets_table)
+        srow = W.QHBoxLayout()
+        for text, icon, tip, fn in (("Detect", "auto", "Find the sheet numbers and titles", self.detect_sheets),
+                                    ("Revision", "add", "Add a revision to the selected sheets", self.add_revision_dialog),
+                                    ("Index", "sheets", "Insert a sheet index page with links", self.insert_index_page),
+                                    ("Slip", "open", "Replace sheets with a new version and keep the markups", self.slip_sheet_dialog)):
+            b = W.QPushButton(tool_icon(icon, 18), text)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            srow.addWidget(b)
+        shl.addLayout(srow)
+        bexp = W.QPushButton("Export sheet list (CSV)…")
+        bexp.clicked.connect(self.export_sheet_csv)
+        shl.addWidget(bexp)
+        self._add_panel(self.left_tabs, shw, "Sheets", "sheets")
+        self.left_tabs.currentChanged.connect(lambda _i: self.refresh_sheets())
         self.left_dock = self._dock("Panels", self.left_tabs, QtCore.Qt.LeftDockWidgetArea)
 
         # ---- right: Properties, Tool Chest, Measurements
@@ -334,8 +438,13 @@ class Main(DocumentOps, W.QMainWindow):
         self.p_info.setWordWrap(True)
         self.p_info.setStyleSheet("color: #666;")
         pl.addRow(self.p_info)
-        for lbl, w in (("Subject", self.p_subject), ("Comment", self.p_comment), ("Status", self.p_status),
-                       ("Replies", self.p_replies), ("", self.p_reply)):
+        self.p_custom_form = W.QFormLayout()          # one editor for each custom column
+        self.p_custom_editors: dict = {}
+        self._cols_sig = None
+        for lbl, w in (("Subject", self.p_subject), ("Comment", self.p_comment), ("Status", self.p_status)):
+            pl.addRow(lbl, w)
+        pl.addRow(self.p_custom_form)
+        for lbl, w in (("Replies", self.p_replies), ("", self.p_reply)):
             pl.addRow(lbl, w)
         self.p_subject.editingFinished.connect(lambda: self._prop(lambda m: m.set_subject(self.p_subject.text())))
         self.p_comment.installEventFilter(self)
@@ -401,9 +510,16 @@ class Main(DocumentOps, W.QMainWindow):
         self.mk_table.setHorizontalHeaderLabels(["Page", "Subject", "Type", "Author", "Status", "Comment", "Value"])
         self.mk_table.horizontalHeader().setStretchLastSection(True)
         self.mk_table.verticalHeader().hide()
+        self.mk_table.horizontalHeader().setSectionResizeMode(W.QHeaderView.Interactive)   # the user can widen a column
+        self.mk_table.setWordWrap(False)
+        self.mk_table.setTextElideMode(QtCore.Qt.ElideRight)
         self.mk_table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.mk_table.customContextMenuRequested.connect(self._table_menu)
         self.mk_table.itemSelectionChanged.connect(self._table_select)
+        hh = self.mk_table.horizontalHeader()
+        hh.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        hh.customContextMenuRequested.connect(self._header_menu)
+        hh.setToolTip("Right-click to add or remove a column")
         self.mk_filter.textChanged.connect(self.refresh_markups)
         self.mk_status.currentIndexChanged.connect(self.refresh_markups)
         mkl.addWidget(self.mk_table)
@@ -446,8 +562,11 @@ class Main(DocumentOps, W.QMainWindow):
         self._act(f, "Save As…", self.save_as, "Ctrl+Shift+S")
         self._act(f, "Save encrypted copy…", self.save_encrypted)
         self._act(f, "Optimize / compress copy…", self.optimize)
+        self._act(f, "Export as PDF/A…", self.export_pdfa)
         f.addSeparator()
+        self._act(f, "Import Bluebeam tool set (.btx)…", self.import_btx)
         self._act(f, "Export page as PNG…", self.export_png)
+        self._act(f, "Export Markup Summary (PDF)…", self.export_summary_pdf)
         self._act(f, "Export markups list (CSV)…", lambda: self._export("csv"))
         self._act(f, "Export measurement summary (CSV)…", lambda: self._export("summary"))
         self._act(f, "Print…", self.print_doc, "Ctrl+P", tool_icon("print"))
@@ -505,6 +624,8 @@ class Main(DocumentOps, W.QMainWindow):
         self._act(m, "Calibrate scale (drag a known length)", lambda: self.set_tool("Calibrate"))
         self._act(m, "Set scale by ratio…", self.scale_ratio)
         self._act(m, "Add viewport scale (drag a region)", lambda: self.set_tool("Viewport"))
+        self.act_arch = self._act(m, "Show feet and inches (12' 6 1/2\")", self.toggle_arch_units)
+        self.act_arch.setCheckable(True)
         self._act(m, "Show scales", self.show_scales)
         self._act(m, "Measurement summary…", self.show_summary)
 
@@ -760,6 +881,7 @@ class Main(DocumentOps, W.QMainWindow):
 
     def _attach(self, d: Document, title):
         cv = Canvas(d)
+        d.recovery_id = recovery.new_id()
         cv.status.connect(self.statusBar().showMessage)
         cv.changed.connect(self._after_change)
         cv.selection_changed.connect(self._load_props)
@@ -796,6 +918,8 @@ class Main(DocumentOps, W.QMainWindow):
                 return
             if r == W.QMessageBox.Save and not self._save(cv.doc):
                 return
+        recovery.remove(cv.doc.recovery_id)       # saved or discarded on purpose: no snapshot is needed
+        self._autosave_rev.pop(cv.doc.recovery_id, None)
         self.tabs.removeTab(i)
         cv.deleteLater()
         self._sync_central()
@@ -826,7 +950,7 @@ class Main(DocumentOps, W.QMainWindow):
             if d.path:
                 d.save()
             else:
-                p, _ = W.QFileDialog.getSaveFileName(self, "Save", "", "PDF (*.pdf)")
+                p, _ = W.QFileDialog.getSaveFileName(self, "Save", getattr(d, "suggested_path", None) or "", "PDF (*.pdf)")
                 if not p:
                     return False
                 d.save(p)
@@ -835,6 +959,8 @@ class Main(DocumentOps, W.QMainWindow):
         except ERRORS as e:
             W.QMessageBox.warning(self, "Save failed", str(e))
             return False
+        recovery.remove(d.recovery_id)
+        self._autosave_rev.pop(d.recovery_id, None)
         self.statusBar().showMessage("Saved")
         return True
 
@@ -851,6 +977,8 @@ class Main(DocumentOps, W.QMainWindow):
             if p:
                 self.cv.select(None)
                 if self._run(self.doc.save, p, msg=f"Saved {p}"):
+                    recovery.remove(self.doc.recovery_id)
+                    self._autosave_rev.pop(self.doc.recovery_id, None)
                     self.tabs.setTabText(self.tabs.currentIndex(), os.path.basename(p))
                     self.prefs.add_recent(p)
 
@@ -927,6 +1055,14 @@ class Main(DocumentOps, W.QMainWindow):
         if cv and cv.tool not in PERSISTENT_TOOLS and not self.act_keep.isChecked():
             self.set_tool("Select", announce=False)
 
+    def toggle_arch_units(self):
+        if not self._need_doc():
+            return self.act_arch.setChecked(False)
+        style = "feet-inches" if self.act_arch.isChecked() else "decimal"
+        if self._run(self.doc.set_unit_style, style, self.doc.fraction) is not None:
+            self.refresh_markups()
+            self.statusBar().showMessage("Lengths in feet and inches." if style == "feet-inches" else "Decimal lengths.")
+
     def _selected(self):
         return self.cv.selected if self.cv else None
 
@@ -972,6 +1108,9 @@ class Main(DocumentOps, W.QMainWindow):
         self.refresh_all()
 
     def _after_change(self):
+        if self.doc:
+            self.act_arch.setChecked(self.doc.unit_style == "feet-inches")  # undo and redo can change the style
+        self.refresh_sheets()
         self.refresh_markups()
         self._load_props()
         self._update_status_widgets()
@@ -980,16 +1119,24 @@ class Main(DocumentOps, W.QMainWindow):
 
     def _title(self):
         d = self.doc
-        return ("*" if d.modified else "") + (os.path.basename(d.path) if d and d.path else "Untitled")
+        if d and d.path:
+            name = os.path.basename(d.path)
+        elif d and getattr(d, "suggested_path", None):
+            name = os.path.basename(d.suggested_path) + " (recovered)"     # restored after a crash, not saved yet
+        else:
+            name = "Untitled"
+        return ("*" if d.modified else "") + name
 
     def refresh_all(self):
         self.refresh_markups()
         self.refresh_thumbs()
         self.refresh_toc()
         self.refresh_layers()
+        self.refresh_sheets()
         self._load_props()
         self._update_status_widgets()
         d = self.doc
+        self.act_arch.setChecked(bool(d) and d.unit_style == "feet-inches")
         self.setWindowTitle(f"OpenRevu — {d.path}" if d and d.path else "OpenRevu")
 
     def refresh_markups(self):
@@ -999,6 +1146,9 @@ class Main(DocumentOps, W.QMainWindow):
         t.setRowCount(0)
         self.meas_table.setRowCount(0)
         d = self.doc
+        cols = d.columns if d else []
+        t.setColumnCount(7 + len(cols))
+        t.setHorizontalHeaderLabels(["Page", "Subject", "Type", "Author", "Status", "Comment", "Value"] + [c["name"] for c in cols])
         if d:
             q, st = self.mk_filter.text().lower(), self.mk_status.currentIndex()
             for m in d.markups():
@@ -1006,14 +1156,17 @@ class Main(DocumentOps, W.QMainWindow):
                 if st and STATUSES[st - 1] != status:
                     continue
                 r = m.measurement()
-                val = format_value(*r) if r else ""
-                row = [str(m.page_no + 1), m.subject, m.kind, m.author, status, m.comment, val]
+                val = d.fmt(*r) if r else ""
+                cv = m.custom()
+                row = [str(m.page_no + 1), m.subject, m.kind, m.author, status, m.comment, val] \
+                    + [("%g" % cv[c["name"]]) if isinstance(cv.get(c["name"]), float) else str(cv.get(c["name"], "")) for c in cols]
                 if q and q not in " ".join(row).lower():
                     continue
                 i = t.rowCount()
                 t.insertRow(i)
                 for c, txt in enumerate(row):
                     it = W.QTableWidgetItem(txt)
+                    it.setToolTip(txt)                 # the full text, when the column is too narrow
                     if c == 0:
                         it.setData(QtCore.Qt.UserRole, len(self._rows))
                         it.setData(QtCore.Qt.DisplayRole, int(txt))
@@ -1021,11 +1174,16 @@ class Main(DocumentOps, W.QMainWindow):
                 self._rows.append(m)
             for k, ((subj, kind, unit), (n, tot)) in enumerate(sorted(d.takeoff_by_subject().items())):
                 self.meas_table.insertRow(k)
-                for c, v in enumerate((subj, str(n), format_value(kind, tot, unit).split(" ")[0], {"area": f"{unit}²", "volume": f"{unit}³"}.get(kind, unit))):
+                for c, v in enumerate((subj, str(n), d.fmt(kind, tot, unit).split(" ")[0], {"area": f"{unit}²", "volume": f"{unit}³"}.get(kind, unit))):
                     self.meas_table.setItem(k, c, W.QTableWidgetItem(v))
         t.setSortingEnabled(True)
+        if not getattr(self, "_mk_widths_set", False):
+            for col, width in enumerate((50, 140, 90, 90, 90, 260, 100)):
+                t.setColumnWidth(col, width)
+            self._mk_widths_set = True
+        self._rebuild_custom_fields()
         if d:
-            lines = [f"{k.title()}: {format_value(k, v, u)}" for (k, u), v in sorted(d.takeoff().items())]
+            lines = [f"{k.title()}: {d.fmt(k, v, u)}" for (k, u), v in sorted(d.takeoff().items())]
             self.totals.setText("Totals — " + ("; ".join(lines) if lines else "no measurements yet"))
         else:
             self.totals.setText("")
@@ -1098,6 +1256,53 @@ class Main(DocumentOps, W.QMainWindow):
             self.layer_list.addItem(it)
         self.layer_list.blockSignals(False)
 
+    def refresh_sheets(self):
+        """Fill the Sheets table. This reads text from every page, so it runs only while the panel is visible."""
+        if self.panel_name(self.left_tabs, self.left_tabs.currentIndex()) != "Sheets" or self.left_dock.isHidden():
+            return
+        t = self.sheets_table
+        keep = set(self.sheets_selected_pages())
+        t.blockSignals(True)
+        t.setRowCount(0)
+        d = self.doc
+        for r in (d.sheet_table() if d else []):
+            i = t.rowCount()
+            t.insertRow(i)
+            info = d.sheet_info(r["page"] - 1, detect=False)
+            vals = [str(r["page"]), r["number"], r["title"], r["discipline"], r["revision"]]
+            for c, v in enumerate(vals):
+                it = W.QTableWidgetItem(v)
+                if c in (0, 4):
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                if c == 4 and info["revisions"]:
+                    it.setToolTip("\n".join(f"{x['rev']}  {x['date']}  {x['description']}" for x in info["revisions"]))
+                t.setItem(i, c, it)
+            if r["page"] - 1 in keep:  # selectRow would drop the earlier rows, so add each row to the selection
+                t.selectionModel().select(t.model().index(i, 0), QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+        t.blockSignals(False)
+
+    def sheets_selected_pages(self) -> list[int]:
+        return sorted({int(self.sheets_table.item(i.row(), 0).text()) - 1 for i in self.sheets_table.selectedIndexes()})
+
+    def _sheet_selected(self):
+        pages = self.sheets_selected_pages()
+        if pages and self.cv:
+            self.cv.goto_page(pages[0])
+
+    def _sheet_edited(self, item):
+        if not self.cv or item.column() not in (1, 2, 3):
+            return
+        pno = int(self.sheets_table.item(item.row(), 0).text()) - 1
+        field = ("number", "title", "discipline")[item.column() - 1]
+        self._run(self.doc.set_sheet, pno, **{field: item.text()})
+        self.refresh_sheets()              # also puts the old value back when the edit was rejected (a duplicate number)
+
+    def export_sheet_csv(self):
+        if self._need_doc():
+            p, _ = W.QFileDialog.getSaveFileName(self, "Export sheet list", "sheets.csv", "CSV (*.csv)")
+            if p:
+                self._run(self.doc.export_sheet_index_csv, p)
+
     def _layer_toggled(self, item):
         if self.cv and item.data(QtCore.Qt.UserRole) is not None:
             on = item.checkState() == QtCore.Qt.Checked
@@ -1135,7 +1340,7 @@ class Main(DocumentOps, W.QMainWindow):
         self.p_replies.clear()
         if m is not None:
             try:
-                self.p_info.setText(f"{m.kind} on page {m.page_no + 1}" + (f"\n{format_value(*m.measurement())}" if m.measurement() else ""))
+                self.p_info.setText(f"{m.kind} on page {m.page_no + 1}" + (f"\n{self.doc.fmt(*m.measurement())}" if m.measurement() else ""))
                 self.p_subject.setText(m.subject)
                 self.p_comment.setPlainText(m.comment)
                 self.p_status.setCurrentIndex(STATUSES.index(m.status) if m.status in STATUSES else 0)
@@ -1147,9 +1352,19 @@ class Main(DocumentOps, W.QMainWindow):
                 self.w_opacity.setValue(m.annot.opacity if m.annot.opacity >= 0 else 1)
                 for a, t in m.replies():
                     self.p_replies.addItem(f"{a}: {t}")
+                cv = m.custom()
+                for name, (col, ed) in self.p_custom_editors.items():
+                    val = cv.get(name, "")
+                    val = "%g" % val if isinstance(val, float) else str(val)
+                    ed.blockSignals(True)
+                    (ed.setCurrentText if isinstance(ed, W.QComboBox) else ed.setText)(val)
+                    ed.blockSignals(False)
+                    ed.setEnabled(True)
             except Exception:
                 pass
         else:
+            for _col, ed in self.p_custom_editors.values():
+                ed.setEnabled(False)
             self.p_info.setText("Select a markup to see its properties.")
             self.p_subject.clear()
             self.p_comment.clear()
@@ -1170,9 +1385,67 @@ class Main(DocumentOps, W.QMainWindow):
         try:
             fn(m)
         except ERRORS as e:
-            return self.statusBar().showMessage(str(e))
+            self.statusBar().showMessage(str(e))
+            return self._load_props()          # put the stored value back into the field that was refused
         self.cv.invalidate([m.page_no])
         self._after_change()
+
+    def _rebuild_custom_fields(self):
+        """One editor per custom column in the Properties panel. Rebuilt only when the columns change."""
+        cols = self.doc.columns if self.doc else []
+        sig = repr(cols)
+        if sig == self._cols_sig:
+            return
+        self._cols_sig = sig
+        while self.p_custom_form.rowCount():
+            self.p_custom_form.removeRow(0)
+        self.p_custom_editors = {}
+        for col in cols:
+            if col["type"] == "choice":
+                ed = W.QComboBox()
+                ed.addItems([""] + col["choices"])
+                ed.activated.connect(lambda _i, n=col["name"], e=ed: self._prop(lambda m: m.set_custom(n, e.currentText())))
+            else:
+                ed = W.QLineEdit(placeholderText="number" if col["type"] == "number" else "")
+                ed.editingFinished.connect(lambda n=col["name"], e=ed: self._prop(lambda m: m.set_custom(n, e.text())))
+            ed.setEnabled(False)
+            self.p_custom_form.addRow(col["name"], ed)
+            self.p_custom_editors[col["name"]] = (col, ed)
+
+    def _header_menu(self, pos):
+        if not self._need_doc():
+            return
+        menu = W.QMenu(self)
+        menu.addAction(tool_icon("add"), "Add column…").triggered.connect(self.add_column_dialog)
+        if self.doc.columns:
+            rm = menu.addMenu(tool_icon("delete"), "Remove column")
+            for c in self.doc.columns:
+                rm.addAction(c["name"]).triggered.connect(lambda _=False, n=c["name"]: self.remove_column(n))
+        menu.exec_(self.mk_table.horizontalHeader().mapToGlobal(pos))
+
+    def add_column_dialog(self):
+        if not self._need_doc():
+            return
+        v = self._form_dialog("Add a column", [("Name", ""), ("Type (text, number, choice)", "text"), ("Choices (separate with commas)", "")])
+        if v and self._run(self.doc.add_column, v["Name"], v["Type (text, number, choice)"].strip().lower(),
+                           v["Choices (separate with commas)"].split(",")) is not None:
+            self.refresh_markups()
+
+    def remove_column(self, name):
+        if self._need_doc() and self._run(self.doc.remove_column, name) is not None:
+            self.refresh_markups()
+
+    def export_summary_pdf(self):
+        if not self._need_doc():
+            return
+        mode, ok = W.QInputDialog.getItem(self, "Markup Summary", "Include a picture of each markup?", ["Yes", "No"], 0, False)
+        if not ok:
+            return
+        p, _ = W.QFileDialog.getSaveFileName(self, "Save the Markup Summary", "markup-summary.pdf", "PDF (*.pdf)")
+        if p:
+            n = self._run(self.doc.export_markup_summary, p, mode == "Yes")
+            if n is not None:
+                self.statusBar().showMessage(f"Markup Summary saved: {n} markup(s).")
 
     def _add_reply(self):
         m = self._selected()
@@ -1350,6 +1623,25 @@ class Main(DocumentOps, W.QMainWindow):
             self._refresh_chest()
             self.show_panel("Tool Chest")
 
+    def import_btx(self):
+        p, _ = W.QFileDialog.getOpenFileName(self, "Bluebeam tool set", "", "Bluebeam tool sets (*.btx);;All files (*)")
+        if not p:
+            return
+        try:
+            res = self.chest.import_btx(p)
+        except (ValueError, OSError) as e:
+            return W.QMessageBox.warning(self, "Import tool set", str(e))
+        self._refresh_chest()
+        self.show_panel("Tool Chest")
+        box = W.QMessageBox(self)
+        box.setWindowTitle("Import tool set")
+        box.setIcon(W.QMessageBox.Information if res.imported else W.QMessageBox.Warning)
+        box.setText(res.summary())
+        if res.skipped:
+            box.setInformativeText("Some tools could not be imported. Press Show Details to see why.")
+            box.setDetailedText("\n".join(f"{n}: {why}" for n, why in res.skipped))
+        box.exec_()
+
     def chest_remove(self):
         it = self.chest_tree.currentItem()
         data = it.data(0, QtCore.Qt.UserRole) if it else None
@@ -1395,12 +1687,89 @@ class Main(DocumentOps, W.QMainWindow):
             self._goto_hit_idx((self.search_list.currentRow() + 1) % len(self._hits))
 
 
+def install_excepthook(parent_getter=lambda: None):
+    """Show unexpected errors in a dialog. Without this, PyQt5 aborts the whole program on an error in an event handler."""
+    import traceback
+
+    busy = {"on": False}
+
+    def hook(etype, value, tb):
+        text = "".join(traceback.format_exception(etype, value, tb))
+        sys.stderr.write(text)
+        if busy["on"] or W.QApplication.instance() is None:
+            return
+        busy["on"] = True
+        try:
+            box = W.QMessageBox(parent_getter())
+            box.setIcon(W.QMessageBox.Critical)
+            box.setWindowTitle("OpenRevu")
+            box.setText("OpenRevu hit an unexpected problem.")
+            box.setInformativeText("You can keep working. Press Ctrl+S to save, or use Undo if something looks wrong.")
+            box.setDetailedText(text)
+            box.exec_()
+        finally:
+            busy["on"] = False
+
+    sys.excepthook = hook
+    return hook
+
+
+def selftest() -> int:
+    """Open a file, draw, measure, save, and reopen, in a window that is never shown. Used to check a build.
+    Returns 0 on success. Prints what failed otherwise."""
+    import tempfile
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ["OPENREVU_NO_SETTINGS"] = "1"
+    from .core import Scale
+    app = W.QApplication.instance() or W.QApplication(["openrevu"])
+    steps = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["OPENREVU_RECOVERY_DIR"] = os.path.join(tmp, "rec")
+            src = os.path.join(tmp, "t.pdf")
+            d = fitz.open()
+            d.new_page(width=612, height=792).insert_text((72, 100), "OpenRevu self-test", fontsize=18)
+            d.save(src)
+            win = Main(src)
+            win.resize(1200, 800)
+            win.show()
+            app.processEvents()
+            steps.append("window")
+            win.doc.set_scale(Scale("ft", 1 / 12))
+            win.doc.add_rect(0, fitz.Rect(100, 150, 200, 220))
+            win.doc.add_length(0, [(100, 300), (172, 300)])
+            win.doc.add_stamp(0, fitz.Rect(300, 100, 460, 150), "OK")
+            win.cv.invalidate()
+            app.processEvents()
+            steps.append("markup")
+            assert win.doc.takeoff()[("length", "ft")] == 6.0
+            win.save()
+            steps.append("save")
+            again = Document(src)
+            assert len(again.markups()) == 3 and again.scale.unit == "ft"
+            assert tool_icon("Stamp").pixmap(24, 24).toImage().pixelColor(12, 12) is not None
+            steps.append("reopen")
+            win.tabs.removeTab(0)
+    except Exception as e:  # noqa: BLE001 - report any failure
+        print(f"self-test FAILED after {', '.join(steps) or 'nothing'}: {type(e).__name__}: {e}")
+        return 1
+    print("self-test passed: " + ", ".join(steps))
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv if argv is None else argv
+    if len(argv) > 1 and argv[1] in ("--version", "-V"):
+        print(f"OpenRevu {__version__}")
+        return 0
+    if len(argv) > 1 and argv[1] == "--selftest":
+        return selftest()
     app = W.QApplication(argv)
     app.setStyle("Fusion")
     win = Main(argv[1] if len(argv) > 1 else None)
+    install_excepthook(lambda: win)
     for extra in argv[2:]:
         win.open(extra)
     win.show()
+    QtCore.QTimer.singleShot(300, win.offer_recovery)     # after the window is on screen
     return app.exec_()

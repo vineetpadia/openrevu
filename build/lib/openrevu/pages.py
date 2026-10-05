@@ -82,15 +82,20 @@ class PageOps:
         src = self._open(path)
         if src.needs_pass and not src.authenticate(password or ""):
             raise PermissionError("source PDF is encrypted")
+        if pages is not None and any(not 0 <= q < len(src) for q in pages):
+            raise IndexError(f"the source PDF has {len(src)} pages; asked for {sorted(pages)}")
         at = len(self.doc) if at is None else at
         n, k = len(self.doc), (len(pages) if pages is not None else len(src))
         kw = {"start_at": at}
+        from .sheets import copy_records
         if pages is not None:
             for p in pages:
                 self.doc.insert_pdf(src, from_page=p, to_page=p, start_at=at)
+                copy_records(src, [p], self.doc, at)
                 at += 1
         else:
             self.doc.insert_pdf(src, **kw)
+            copy_records(src, range(len(src)), self.doc, kw["start_at"])
         src.close()
         self._remap_scales({i: i + (k if i >= kw["start_at"] else 0) for i in range(n)})
         return k
@@ -107,9 +112,11 @@ class PageOps:
 
     def extract_pages(self, pnos, out_path):
         self._check(pnos)
+        from .sheets import copy_records
         out = fitz.open()
         for p in pnos:
             out.insert_pdf(self.doc, from_page=p, to_page=p)
+        copy_records(self.doc, pnos, out, 0)
         out.save(out_path, garbage=3, deflate=True)
         return out_path
 
@@ -161,7 +168,10 @@ class PageOps:
 
     def links(self, pno):
         # PyMuPDF's in-memory link list lags behind insert_link on a modified page; a serialized copy is exact.
-        return fitz.open("pdf", self.doc.tobytes())[pno].get_links()
+        # The copy is rebuilt only when the document has changed.
+        if self._link_doc is None or self._link_rev != self.revision:
+            self._link_doc, self._link_rev = fitz.open("pdf", self.doc.tobytes()), self.revision
+        return self._link_doc[pno].get_links()
 
     @mutates
     def set_page_labels(self, rules):
@@ -330,6 +340,59 @@ class PageOps:
         md.update({k: v for k, v in fields.items() if k in ("title", "author", "subject", "keywords")})
         self.doc.set_metadata(md)
 
+    def export_pdfa(self, path, level="2b", flatten=True):
+        """Save a PDF/A copy (Ghostscript) and check it with veraPDF if available. Returns a PdfaReport.
+        By default markups are flattened first, because conversion may not keep every annotation."""
+        import tempfile, os
+        from . import pdfa
+        if not pdfa.available():
+            raise RuntimeError("PDF/A export needs Ghostscript (https://ghostscript.com) on your PATH.")
+        self._store_scales()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.pdf")
+            data = self.doc.tobytes()
+            tmpdoc = fitz.open("pdf", data)
+            if tmpdoc.needs_pass:
+                raise PermissionError("decrypt the document before you export it as PDF/A")
+            if level == "1b":
+                self._blend_transparency(tmpdoc)   # PDF/A-1 has no transparency
+            if flatten:
+                tmpdoc.bake(annots=True, widgets=True)
+            tmpdoc.save(src)
+            before = [pg.get_text().strip() for pg in tmpdoc]
+            tmpdoc.close()
+            rep = pdfa.convert(src, path, level)
+            out = fitz.open(path)
+            for i, text in enumerate(before):
+                if text and i < len(out) and not out[i].get_text().strip():
+                    rep.warnings.append(f"page {i + 1} lost its selectable text (it was drawn as an image). "
+                                        "It uses transparency, which this PDF/A level does not allow. Try level 2b.")
+            out.close()
+            return rep
+
+    @staticmethod
+    def _blend_transparency(doc):
+        """Replace each partly transparent markup colour by the same colour mixed with white, at full opacity."""
+        for pg in doc:
+            for a in list(pg.annots() or []):
+                op = a.opacity
+                if op is None or not (0 <= op < 1):
+                    continue
+                c = a.colors
+                mix = lambda col: tuple(v * op + (1 - op) for v in col) if col else None  # noqa: E731
+                try:
+                    a.set_colors(stroke=mix(c.get("stroke")), fill=mix(c.get("fill")))
+                    a.set_opacity(1)
+                    a.update()
+                except Exception:
+                    pass
+
+    def export_markup_summary(self, path, include_images=True, statuses=None):
+        """Write a PDF report of the markups (page, subject, author, status, comment, replies, measurement,
+        custom columns, and a picture). statuses limits the report, for example ["Accepted"]. Returns the count."""
+        from .report import markup_summary_pdf
+        return markup_summary_pdf(self, path, include_images, statuses)
+
     def optimize(self, path):
         """Save with maximum structural compression; returns (before, after) byte sizes."""
         self._store_scales()
@@ -460,42 +523,7 @@ class PageOps:
 
 
 def compare_pdfs(old_path, new_path, out_path, dpi=100):
-    """Overlay comparison: pixels only in old = red, only in new = blue, shared = grey.
-    Returns [changed_fraction per page]; writes a PDF of the overlays."""
-    from .core import Document
-    a, b = Document._open(old_path), Document._open(new_path)
-    out, stats = fitz.open(), []
-    for i in range(max(len(a), len(b))):
-        pa = a[i].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY) if i < len(a) else None
-        pb = b[i].get_pixmap(dpi=dpi, colorspace=fitz.csGRAY) if i < len(b) else None
-        w = max(p.width for p in (pa, pb) if p)
-        h = max(p.height for p in (pa, pb) if p)
-
-        def grid(p):
-            g = bytearray(b"\xff" * (w * h))
-            if p:
-                for y in range(p.height):
-                    g[y * w:y * w + p.width] = p.samples[y * p.width:(y + 1) * p.width]
-            return g
-
-        ga, gb = grid(pa), grid(pb)
-        rgb = bytearray(w * h * 3)
-        changed = 0
-        for k in range(w * h):
-            da, db = ga[k] < 128, gb[k] < 128
-            if da and db:
-                c = (110, 110, 110)
-            elif da:
-                c, changed = (230, 40, 40), changed + 1
-            elif db:
-                c, changed = (40, 80, 230), changed + 1
-            else:
-                c = (255, 255, 255)
-            rgb[3 * k:3 * k + 3] = bytes(c)
-        pix = fitz.Pixmap(fitz.csRGB, w, h, bytes(rgb), False)
-        pg = out.new_page(width=w * 72 / dpi, height=h * 72 / dpi)
-        pg.insert_image(pg.rect, pixmap=pix)
-        stats.append(changed / (w * h))
-    out.save(out_path, garbage=3, deflate=True)
-    a.close(); b.close()
-    return stats
+    """Overlay comparison by page position. Returns the share of each page's area that differs.
+    (For sheet matching, tolerance, and text differences use openrevu.compare.compare_documents.)"""
+    from .compare import compare_documents
+    return [r.area_fraction for r in compare_documents(old_path, new_path, out_path, match="page", dpi=dpi, tolerance=0)]

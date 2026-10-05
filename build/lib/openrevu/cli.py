@@ -35,19 +35,25 @@ def main(argv=None) -> int:
     add("encrypt", "AES-256 password", out, (("--password",), {"required": True}))
     add("csv", "export markups CSV", (("output",), {}))
     add("summary", "export measurement summary CSV", (("output",), {}))
-    add("compare", "overlay compare two PDFs", (("new",), {}), out)
+    add("compare", "compare two PDFs (overlay PDF, text changes)", (("new",), {}), out, (("--match",), {"default": "sheet", "choices": ["sheet", "page"]}), (("--csv",), {"default": None}), (("--new-password",), {"default": None}))
     add("numbering", "Bates numbering", out, (("--prefix",), {"default": ""}), (("--start",), {"type": int, "default": 1}))
     add("run", "run a Python script with `doc` (an openrevu Document) preloaded; saves to output", out) \
         .add_argument("script")
+    add("pdfa", "export a PDF/A copy (needs Ghostscript; checked with veraPDF if installed)", out, (("--level",), {"default": "2b", "choices": ["1b", "2b", "3b"]}))
+    add("report", "Markup Summary report (PDF)", out, (("--no-images",), {"action": "store_true"}), (("--status",), {"action": "append", "default": None, "help": "only this status; use several times, '' for none"}))
     add("sheets", "auto-bookmark sheet numbers and link sheet references", out)
     add("footer", "page x of y footer", out)
     a = p.parse_args(argv)
     try:
         if a.cmd == "compare":
-            if a.in_password:
-                raise ValueError("compare does not support encrypted inputs")
-            for i, f in enumerate(compare_pdfs(a.input, a.new, a.output)):
-                print(f"page {i + 1}: {f:.2%} changed")
+            from .compare import compare_documents, summarize, write_csv
+            res = compare_documents(a.input, a.new, a.output, match=a.match, old_password=a.in_password, new_password=a.new_password)
+            for r in res:
+                extra = f", {r.changed_fraction:.1%} of the drawing, +{r.words_added}/-{r.words_removed} words" if r.status == "changed" else ""
+                print(f"{r.number}: {r.status}{extra}")
+            print(summarize(res))
+            if a.csv:
+                write_csv(res, a.csv)
             return 0
         d = _doc(a)
         if a.cmd == "merge":
@@ -74,6 +80,13 @@ def main(argv=None) -> int:
             d.export_summary_csv(a.output)
         elif a.cmd == "numbering":
             d.bates(a.prefix, a.start); d.save(a.output)
+        elif a.cmd == "report":
+            print(f"{d.export_markup_summary(a.output, not a.no_images, a.status)} markup(s) in the report")
+        elif a.cmd == "pdfa":
+            rep = d.export_pdfa(a.output, a.level)
+            print(rep.summary())
+            if rep.validated and not rep.compliant:
+                return 2
         elif a.cmd == "run":
             with open(a.script) as fh:
                 code = compile(fh.read(), a.script, "exec")

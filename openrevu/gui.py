@@ -1714,8 +1714,56 @@ def install_excepthook(parent_getter=lambda: None):
     return hook
 
 
+def selftest() -> int:
+    """Open a file, draw, measure, save, and reopen, in a window that is never shown. Used to check a build.
+    Returns 0 on success. Prints what failed otherwise."""
+    import tempfile
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ["OPENREVU_NO_SETTINGS"] = "1"
+    from .core import Scale
+    app = W.QApplication.instance() or W.QApplication(["openrevu"])
+    steps = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["OPENREVU_RECOVERY_DIR"] = os.path.join(tmp, "rec")
+            src = os.path.join(tmp, "t.pdf")
+            d = fitz.open()
+            d.new_page(width=612, height=792).insert_text((72, 100), "OpenRevu self-test", fontsize=18)
+            d.save(src)
+            win = Main(src)
+            win.resize(1200, 800)
+            win.show()
+            app.processEvents()
+            steps.append("window")
+            win.doc.set_scale(Scale("ft", 1 / 12))
+            win.doc.add_rect(0, fitz.Rect(100, 150, 200, 220))
+            win.doc.add_length(0, [(100, 300), (172, 300)])
+            win.doc.add_stamp(0, fitz.Rect(300, 100, 460, 150), "OK")
+            win.cv.invalidate()
+            app.processEvents()
+            steps.append("markup")
+            assert win.doc.takeoff()[("length", "ft")] == 6.0
+            win.save()
+            steps.append("save")
+            again = Document(src)
+            assert len(again.markups()) == 3 and again.scale.unit == "ft"
+            assert tool_icon("Stamp").pixmap(24, 24).toImage().pixelColor(12, 12) is not None
+            steps.append("reopen")
+            win.tabs.removeTab(0)
+    except Exception as e:  # noqa: BLE001 - report any failure
+        print(f"self-test FAILED after {', '.join(steps) or 'nothing'}: {type(e).__name__}: {e}")
+        return 1
+    print("self-test passed: " + ", ".join(steps))
+    return 0
+
+
 def main(argv=None):
     argv = sys.argv if argv is None else argv
+    if len(argv) > 1 and argv[1] in ("--version", "-V"):
+        print(f"OpenRevu {__version__}")
+        return 0
+    if len(argv) > 1 and argv[1] == "--selftest":
+        return selftest()
     app = W.QApplication(argv)
     app.setStyle("Fusion")
     win = Main(argv[1] if len(argv) > 1 else None)

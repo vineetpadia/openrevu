@@ -1,0 +1,71 @@
+name: release
+
+# Builds the packaged program for Linux, Windows and macOS, and the Python packages.
+# A tag that starts with "v" (for example v0.4.0) also publishes a GitHub release with these files.
+# "Run workflow" in the Actions tab builds everything and keeps the files as artifacts, without a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Check the version
+        shell: bash
+        run: python packaging/check_version.py "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon0 libgl1 libdbus-1-3 libfontconfig1
+      - run: pip install ".[fill]" pyinstaller
+      - run: pyinstaller --noconfirm packaging/openrevu.spec
+      - name: Self-test the packaged program
+        shell: bash
+        env: { QT_QPA_PLATFORM: offscreen }
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=dist/OpenRevu/OpenRevu.exe; else exe=dist/OpenRevu/OpenRevu; fi
+          "$exe" --selftest
+          echo "self-test exit code: $?"
+      - name: Package
+        shell: bash
+        run: |
+          v=$(python -c "import openrevu; print(openrevu.__version__)")
+          name="OpenRevu-$v-${RUNNER_OS}"
+          cd dist
+          if [ "$RUNNER_OS" = "Linux" ]; then tar czf "../$name.tar.gz" OpenRevu; else python -c "import shutil,sys; shutil.make_archive(sys.argv[1], 'zip', '.', 'OpenRevu')" "../$name"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenRevu-${{ runner.os }}
+          path: |
+            OpenRevu-*.tar.gz
+            OpenRevu-*.zip
+
+  python-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install build && python -m build
+      - uses: actions/upload-artifact@v4
+        with: { name: python-package, path: dist/* }
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build, python-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # needed to create the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: files, merge-multiple: true }
+      - name: Create the release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release create "${{ github.ref_name }}" files/* --repo "${{ github.repository }}" --title "OpenRevu ${{ github.ref_name }}" --generate-notes
