@@ -17,19 +17,24 @@ def _date(raw: str) -> str:
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
 
 
-def _wrap(text: str, width: float, size: float = 9) -> list[str]:
-    """Break text into lines that fit width. Long words are cut."""
+FONTS = {"": fitz.Font("helv"), "b": fitz.Font("hebo"), "i": fitz.Font("heit")}
+FONT_NAMES = {"": "helv", "b": "hebo", "i": "heit"}
+
+
+def _wrap(text: str, width: float, size: float = 9, style: str = "") -> list[str]:
+    """Break text into lines that fit width, using the widths of the font for this style. Long words are cut."""
+    font = FONTS[style]
     lines: list[str] = []
     for para in str(text).splitlines() or [""]:
         cur = ""
         for word in para.split(" "):
-            while FONT.text_length(word, size) > width and len(word) > 1:  # cut a word that is wider than the line
-                cut = max(1, int(len(word) * width / FONT.text_length(word, size)) - 1)
+            while font.text_length(word, size) > width and len(word) > 1:  # cut a word that is wider than the line
+                cut = max(1, int(len(word) * width / font.text_length(word, size)) - 1)
                 if cur:
                     lines.append(cur); cur = ""
                 lines.append(word[:cut]); word = word[cut:]
             trial = (cur + " " + word).strip() if cur else word
-            if FONT.text_length(trial, size) <= width:
+            if font.text_length(trial, size) <= width:
                 cur = trial
             else:
                 lines.append(cur); cur = word
@@ -37,7 +42,8 @@ def _wrap(text: str, width: float, size: float = 9) -> list[str]:
     return lines
 
 
-def markup_summary_pdf(doc, path: str, include_images: bool = True, statuses=None, title: str | None = None) -> int:
+def markup_summary_pdf(doc, path: str, include_images: bool = True, statuses=None, title: str | None = None,
+                       encryption: dict | None = None) -> int:
     """Write the report. statuses: only list markups with these statuses ("" means no status). Returns the count."""
     items = [m for m in doc.markups() if statuses is None or m.status in statuses]
     items.sort(key=lambda m: (m.page_no, m.rect.y0, m.rect.x0))
@@ -87,30 +93,42 @@ def markup_summary_pdf(doc, path: str, include_images: bool = True, statuses=Non
             v = m.custom().get(col["name"])
             if v is not None:
                 info.append(("", f"{col['name']}: {v:g}" if isinstance(v, float) else f"{col['name']}: {v}"))
-        lines = [(style, ln) for style, t in info for ln in _wrap(t, text_w)]
-        h = max(IMG_H if include_images else 0, len(lines) * LINE) + 12
-        heading_h = 24 if m.page_no != last_page else 0
-        if state["y"] + h + heading_h > PAGE_H - 50:
+        lines = [(style, ln) for style, t in info for ln in _wrap(t, text_w, 9, style)]
+        heading = m.page_no != last_page
+        heading_h = 24 if heading else 0
+        limit = PAGE_H - 50
+        # an entry needs room for its heading and picture (or at least three lines) before it starts on this page
+        first_need = heading_h + (IMG_H if include_images else LINE * min(3, len(lines))) + 12
+        if state["y"] + first_need > limit:
             new_page()
-        if m.page_no != last_page:
+        if heading:
             sheet = doc.sheet_info(m.page_no)["number"]
             state["page"].insert_text((MARGIN, state["y"] + 14), f"Page {m.page_no + 1}" + (f"  ({sheet})" if sheet else ""),
                                       fontsize=12, fontname="hebo")
             state["y"] += heading_h
             last_page = m.page_no
-        y0 = state["y"]
-        if include_images:
-            clip = (m.rect + (-30, -30, 30, 30)) & doc.doc[m.page_no].rect
-            if not clip.is_empty:
-                pix = doc.render(m.page_no, 1.3, clip=clip)
-                box = fitz.Rect(MARGIN, y0, MARGIN + IMG_W, y0 + IMG_H)
-                state["page"].insert_image(box, pixmap=pix, keep_proportion=True)
-                state["page"].draw_rect(box, color=(0.8, 0.8, 0.8), width=0.5)
-        for k, (style, ln) in enumerate(lines):
-            font = {"b": "hebo", "i": "heit"}.get(style, "helv")
-            state["page"].insert_text((text_x, y0 + 9 + k * LINE), ln, fontsize=9, fontname=font)
-        state["y"] = y0 + h
-        state["page"].draw_line((MARGIN, state["y"] - 4), (PAGE_W - MARGIN, state["y"] - 4), color=(0.9, 0.9, 0.9), width=0.4)
-    out.save(path, garbage=3, deflate=True)
+        first = True
+        rest = lines
+        while True:
+            fit = max(1, int((limit - state["y"] - 12) // LINE))
+            chunk, rest = rest[:fit], rest[fit:]            # a long entry continues on the next page, nothing is cut off
+            y0 = state["y"]
+            h = max(IMG_H if (include_images and first) else 0, len(chunk) * LINE) + 12
+            if include_images and first:
+                clip = (m.rect + (-30, -30, 30, 30)) & doc.doc[m.page_no].rect
+                if not clip.is_empty:
+                    pix = doc.render(m.page_no, 1.3, clip=clip)
+                    box = fitz.Rect(MARGIN, y0, MARGIN + IMG_W, y0 + IMG_H)
+                    state["page"].insert_image(box, pixmap=pix, keep_proportion=True)
+                    state["page"].draw_rect(box, color=(0.8, 0.8, 0.8), width=0.5)
+            for k, (style, ln) in enumerate(chunk):
+                state["page"].insert_text((text_x, y0 + 9 + k * LINE), ln, fontsize=9, fontname=FONT_NAMES[style])
+            state["y"] = y0 + h
+            state["page"].draw_line((MARGIN, state["y"] - 4), (PAGE_W - MARGIN, state["y"] - 4), color=(0.9, 0.9, 0.9), width=0.4)
+            first = False
+            if not rest:
+                break
+            new_page()
+    out.save(path, garbage=3, deflate=True, **(encryption or {}))
     out.close()
     return len(items)

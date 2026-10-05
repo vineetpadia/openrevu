@@ -258,14 +258,24 @@ class DocumentOps:
         if not out:
             return
         from .compare import compare_documents
-        W.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            res = compare_documents(self.doc.path, other, out, match="sheet" if mode.startswith("By sheet") else "page",
-                                    old_password=getattr(self.doc, "_password", None))
-        except ERRORS as e:
-            W.QApplication.restoreOverrideCursor()
-            return W.QMessageBox.warning(self, "Compare", str(e))
-        W.QApplication.restoreOverrideCursor()
+        new_pw = None
+        while True:
+            W.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            try:
+                res = compare_documents(self.doc.path, other, out, match="sheet" if mode.startswith("By sheet") else "page",
+                                        old_password=getattr(self.doc, "_password", None), new_password=new_pw)
+                break
+            except PermissionError:               # the new file has a password: ask for it
+                W.QApplication.restoreOverrideCursor()
+                new_pw, ok = W.QInputDialog.getText(self, "Password", "Password for the new version:", W.QLineEdit.Password)
+                if not ok:
+                    return
+                continue
+            except ERRORS as e:
+                W.QApplication.restoreOverrideCursor()
+                return W.QMessageBox.warning(self, "Compare", str(e))
+            finally:
+                W.QApplication.restoreOverrideCursor()
         self.build_compare_dialog(res, out).exec_()
 
     def build_compare_dialog(self, results, overlay_path):

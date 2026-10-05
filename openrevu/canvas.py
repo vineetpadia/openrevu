@@ -17,6 +17,9 @@ ALL_TOOLS = ["Select", "Rectangle", "Ellipse", "Line", "Arrow", "Polyline", "Clo
              "Calibrate", "Length", "Polyline", "Perimeter", "Area", "RectArea", "EllipseArea", "Volume",
              "Diameter", "Angle", "Count"]
 HANDLE = 8
+# tools that need a region with both a width and a height (a straight horizontal or vertical drag has no area)
+AREA_TOOLS = {"Rectangle", "Ellipse", "Cloud", "Highlight", "Underline", "Strikeout", "Squiggly", "Text", "Callout",
+              "Redact", "RectArea", "EllipseArea", "Viewport", "Snapshot", "CopyText", "Link", "Image", "Stamp", "Signature"}
 
 
 class Canvas(W.QGraphicsView):
@@ -408,6 +411,17 @@ class Canvas(W.QGraphicsView):
         return None
 
     def _commit_drag(self, pno, a, b, pts):
+        r, t = fitz.Rect(a, b).normalize(), self.tool
+        if t in AREA_TOOLS and (r.width < 1 or r.height < 1) and not (t in ("Stamp", "Signature", "Image") and r.width < 20):
+            self.status.emit("Drag a region with some width and some height. A straight horizontal or vertical drag has no area.")
+            return self.invalidate([pno])
+        try:
+            self._create_markup(pno, a, b, pts)
+        except (ValueError, RuntimeError) as e:     # a failure here must not end the program
+            self.status.emit(f"Cannot place that markup: {e}")
+            self.invalidate([pno])
+
+    def _create_markup(self, pno, a, b, pts):
         r, t, d, c = fitz.Rect(a, b).normalize(), self.tool, self.doc, self.color
         w, op = self.width, self.opacity
         if t == "Rectangle": d.add_rect(pno, r, c, w, fill=self.fill, opacity=op)

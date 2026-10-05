@@ -137,3 +137,41 @@ def test_report_on_rotated_page_and_cli(pdf, tmp_path):
     assert "on a rotated sheet" in t
     assert main(["report", path, str(tmp_path / "o2.pdf"), "--no-images", "--status", "Accepted"]) == 0
     assert "There are no markups" in fitz.open(str(tmp_path / "o2.pdf"))[0].get_text()
+
+
+# ---------- third-review regressions: nothing is cut off in the report ----------
+def test_a_very_long_comment_continues_on_the_next_page(pdf, tmp_path):
+    d = Document(pdf)
+    d.add_rect(0, fitz.Rect(10, 10, 60, 60))
+    d.markups()[0].set_comment("\n".join(f"line {i} of a very long comment" for i in range(200)))
+    d.add_rect(1, fitz.Rect(10, 10, 60, 60)); d.markups()[-1].set_comment("a short one")
+    out = str(tmp_path / "long.pdf")
+    assert d.export_markup_summary(out) == 2
+    r = fitz.open(out)
+    text = "".join(p.get_text() for p in r)
+    for i in (0, 57, 58, 120, 199):
+        assert f"line {i} of a very long comment" in text, i              # the first, the middle, and the last line are all there
+    assert r.page_count >= 4 and "a short one" in text
+    for p in r:
+        for b in p.get_text("blocks"):
+            assert b[3] <= 792 - 40 and b[2] <= 612                       # nothing is below the bottom margin or right of the page
+
+
+def test_bold_headings_are_wrapped_with_the_bold_font(pdf, tmp_path):
+    d = Document(pdf)
+    d.add_rect(0, fitz.Rect(10, 10, 60, 60)); m = d.markups()[0]
+    m.set_subject("W" * 12 + " " + "MWMWMWMW " * 8)
+    d.doc.xref_set_key(m.xref, "T", "(" + "Reviewer " * 6 + ")")
+    out = str(tmp_path / "b.pdf"); d.export_markup_summary(out, include_images=False)
+    for b in fitz.open(out)[0].get_text("blocks"):
+        assert b[2] <= 612 - 40 + 1                                       # the wide bold text stays inside the right margin
+
+
+def test_wrap_uses_the_right_font_for_each_style():
+    from openrevu.report import FONTS, _wrap
+    text = "Wide wide wide wide wide wide wide wide"
+    for style in ("", "b", "i"):
+        for line in _wrap(text, 100, 9, style):
+            assert FONTS[style].text_length(line, 9) <= 100.5
+    assert len(_wrap(text, 100, 9, "b")) >= len(_wrap(text, 100, 9, ""))  # bold is wider, so it needs at least as many lines
+    assert _wrap("", 100) == [""] and _wrap("x" * 500, 50)[0] != ""

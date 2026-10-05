@@ -245,3 +245,103 @@ def test_title_does_not_repeat_the_sheet_number(tmp_path):
     doc = Document(path)
     assert doc.sheet_info(0)["title"] == "Ground floor plan"
     assert doc.sheet_info(1)["title"] == ""                  # nothing but the number: no title
+
+
+# ---------- third-review regressions: slip sheet ----------
+def test_named_destinations_and_open_action_follow_the_new_page(tmp_path):
+    path = make_set(tmp_path / "old.pdf", SET_V1)
+    d = fitz.open(path)
+    cat, p0, p2 = d.pdf_catalog(), d.page_xref(0), d.page_xref(2)
+    d.xref_set_key(cat, "Dests", f"<</top [{p0} 0 R /XYZ 0 792 0]/roof [{p2} 0 R /Fit]>>")
+    d.xref_set_key(cat, "OpenAction", f"[{p0} 0 R /Fit]")
+    link = d.get_new_xref(); d.update_object(link, "<</Type/Annot/Subtype/Link/Rect[10 10 100 40]/Border[0 0 0]/A<</S/GoTo/D(roof)>>>>")
+    d[1].set_rotation(0)
+    d.xref_set_key(d.page_xref(1), "Annots", f"[{link} 0 R]")
+    d.saveIncr()
+    doc = Document(path)
+    assert [l["page"] for l in doc.links(1)] == [2]                                  # the named link reaches the roof sheet
+    doc.slip_sheet(make_set(tmp_path / "new.pdf", [("S-201", "Roof", "Rev TWO"), ("A-101", "Ground", "Rev TWO")]))
+    assert "Rev TWO" in doc.page_text(2) and [l["page"] for l in doc.links(1)] == [2]     # still the (new) roof sheet
+    cat = doc.doc.pdf_catalog()
+    assert doc.doc.xref_get_key(cat, "OpenAction")[1].startswith(f"[{doc.doc.page_xref(0)} 0 R")
+    dests = doc.doc.xref_get_key(cat, "Dests")[1]
+    compact = dests.replace(" ", "")
+    assert f"[{doc.doc.page_xref(0)}0R/XYZ" in compact and f"[{doc.doc.page_xref(2)}0R/Fit" in compact
+    out = str(tmp_path / "o.pdf"); doc.save(out)
+    r = Document(out)
+    assert [l["page"] for l in r.links(1)] == [2]                                    # survives a save too
+    for i in range(r.page_count):
+        r.render(i, 0.4)
+
+
+def test_the_page_tree_is_not_touched_by_retargeting(tmp_path):
+    path = make_set(tmp_path / "old.pdf", SET_V1)
+    d = Document(path)
+    d.slip_sheet(make_set(tmp_path / "new.pdf", [("A-101", "x", "y")]))
+    out = str(tmp_path / "o.pdf"); d.save(out)
+    r = fitz.open(out)
+    assert r.page_count == 3 and len({r.page_xref(i) for i in range(3)}) == 3        # three distinct pages, none duplicated
+
+
+def test_duplicate_numbers_in_the_new_file_are_reported_and_do_not_poison_later_slips(tmp_path):
+    d = Document(make_set(tmp_path / "old.pdf", SET_V1))
+    new = make_set(tmp_path / "new.pdf", [("A-101", "x", "one"), ("A-101", "x", "two"), ("B-9", "y", "z"), ("B-9", "y", "w")])
+    rep = d.slip_sheet(new)
+    assert rep.added == ["A-101", "B-9", "B-9"] and rep.duplicate_numbers == ["A-101", "B-9"]
+    assert "added without a number" in rep.summary()
+    nums = [d.sheet_record(i).get("number") for i in range(d.page_count)]
+    assert [n for n in nums if n].count("B-9") == 1 and nums.count("A-101") == 1      # each number is stored once
+    d.slip_sheet(make_set(tmp_path / "next.pdf", [("A-101", "x", "three")]))         # a later slip still works
+    assert "three" in d.page_text(0)
+    dup = [i for i in range(d.page_count) if d.sheet_record(i).get("unnumbered")]
+    assert dup and all(d.sheet_info(i)["number"] == "" for i in dup)                 # never detected again from the text
+    d.detect_sheets()                                                                # detection numbers the other pages...
+    assert all(d.sheet_info(i)["number"] == "" for i in dup)                         # ...but leaves these alone
+    d.set_sheet(dup[0], number="A-777")                                              # the user can give one a number later
+    assert d.sheet_info(dup[0])["number"] == "A-777" and "unnumbered" not in d.sheet_record(dup[0])
+
+
+def test_a_rotation_difference_is_reported(tmp_path):
+    old = make_set(tmp_path / "old.pdf", SET_V1)
+    f = fitz.open(old); f[0].set_rotation(90); f.saveIncr()
+    d = Document(old)
+    rep = d.slip_sheet(make_set(tmp_path / "new.pdf", [("A-101", "x", "y")], size=(792, 612)), match="page")   # no rotation
+    assert rep.rotation_changed == [("A-101", 90, 0)] and "different page rotation" in rep.summary()
+    assert [num for num, *_ in rep.replaced] == ["A-101"]
+
+
+def test_detect_sheets_changes_nothing_if_it_fails_halfway(v1, monkeypatch):
+    d = Document(v1)
+    real = Document._detect
+    calls = {"n": 0}
+    def flaky(self, pno, pattern=None, corner=None):
+        calls["n"] += 1
+        if pno == 2:
+            raise RuntimeError("page 3 cannot be read")
+        return real(self, pno, pattern, corner)
+    monkeypatch.setattr(Document, "_detect", flaky)
+    steps = len(d._undo)
+    with pytest.raises(RuntimeError, match="page 3"):
+        d.detect_sheets()
+    assert [d.sheet_record(i) for i in range(3)] == [{}, {}, {}]      # pages 1 and 2 were not written
+    assert len(d._undo) == steps and not d.modified
+
+
+def test_a_failure_after_an_in_place_change_restores_the_document(v1):
+    """The page and object counts stay the same here, so only a full rollback can undo the change."""
+    from openrevu._util import mutates
+
+    class D(Document):
+        @mutates
+        def half_done(self):
+            self.doc.xref_set_key(self.doc.page_xref(0), "OR_Test", "(changed)")
+            self.set_scale(Scale("m", 0.5))
+            raise RuntimeError("fails after two in-place changes")
+
+    d = D(v1)
+    steps, modified = len(d._undo), d.modified
+    with pytest.raises(RuntimeError, match="fails after"):
+        d.half_done()
+    assert d.doc.xref_get_key(d.doc.page_xref(0), "OR_Test")[0] == "null"       # the stray key is gone
+    assert d.scale.unit != "m" and (len(d._undo), d.modified) == (steps, modified)
+    d.add_rect(0, fitz.Rect(1, 1, 9, 9)); assert len(d.markups()) == 1            # the document is fully usable

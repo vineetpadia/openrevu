@@ -340,38 +340,61 @@ class Markup:
         rd = _xget(self.d.doc, self.xref, "RD")
         return tuple(float(v) for v in rd.strip("[]").split()) if rd else (0.0, 0.0, 0.0, 0.0)
 
+    def _label_center(self, kind):
+        """Where the measurement label goes (visual coordinates)."""
+        if self.kind == "Circle":
+            vr = self.rect
+            return ((vr.x0 + vr.x1) / 2, (vr.y0 + vr.y1) / 2)
+        pts = self.points()
+        if kind == "angle":
+            return pts[1]
+        if kind == "length" and len(pts) > 2:
+            return pts[len(pts) // 2]
+        return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+
+    def _redraw_label(self, kind, val, unit):
+        """Replace the label of this measurement. Does nothing if it has no label."""
+        labels = [c for c in self._children() if c.info.get("subject") == "Label"]
+        if not labels:
+            return
+        for c in labels:
+            self._page.delete_annot(c)
+        text = self.d.fmt(kind, val, unit)
+        color = tuple(self.annot.colors.get("stroke") or (0, 0.4, 1))   # the label has the colour of its markup
+        self.d._label(self.page_no, self._label_center(kind), "Ø " + text if kind == "diameter" else text, color, self)
+
+    def _relabel(self, kind):
+        """Redraw the label from the stored value. The value itself is never changed."""
+        k, val, unit = self.measurement()
+        self._redraw_label(k, val, unit)
+
     def _remeasure(self, kind):
-        """Recompute the stored value (and relabel) after the geometry changed."""
+        """Compute the value again from the geometry (after a resize), store it with the unit of the scale that was
+        used, and redraw the label. The scale is looked up in the same way as when the measurement was made."""
         d, pno = self.d, self.page_no
-        sc = d.scale_at(pno, [self.rect.tl, self.rect.br])
         if self.kind == "Circle":
             l, t, r_, b_ = self._rd()
             vr = self.rect
             w, h = vr.width - l - r_, vr.height - t - b_
+            sc = d.scale_at(pno, [vr.tl, vr.br])
             val = sc.unit_per_pt * w if kind == "diameter" else 3.141592653589793 / 4 * w * h * sc.unit_per_pt ** 2
-            center = ((vr.x0 + vr.x1) / 2, (vr.y0 + vr.y1) / 2)
         else:
             pts = self.points()
-            center = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+            sc = d.scale_at(pno, pts)
             if kind == "length":
                 val = sc.length(pts)
-                center = pts[len(pts) // 2] if len(pts) > 2 else center
             elif kind == "perimeter":
                 val = sc.length(pts + pts[:1])
             elif kind == "angle":
-                val, center = angle_deg(*pts), pts[1]
+                val = angle_deg(*pts)
             else:
                 cut = sum(sc.area(c.points()) for c in self._children_markups() if c.subject == "Cutout")
                 val = sc.area(pts) - cut
                 if kind == "volume":
                     val *= float(_xget(d.doc, self.xref, DEPTH_KEY) or 1)
-        unit = self.measurement()[2]
+        unit = "deg" if kind == "angle" else sc.unit
         d.doc.xref_set_key(self.xref, MEASURE_KEY, f"({kind}:{val:.10g}:{unit})")
-        labels = [c for c in self._children() if c.info.get("subject") == "Label"]
-        for c in labels:
-            self._page.delete_annot(c)
-        if labels:
-            d._label(pno, center, d.fmt(kind, val, unit) if kind != "diameter" else "Ø " + d.fmt(kind, val, unit), (0, 0.4, 1), self)
+        self._redraw_label(kind, val, unit)
 
     def _apply(self, new_u: fitz.Rect, children=True):
         """Map the annotation's current (API-space) bbox onto new_u, scaling vertices accordingly."""
@@ -549,6 +572,14 @@ class Document(SheetOps, PageOps):
         self._store_scales()
         return self._dump()
 
+    def _encryption_kwargs(self) -> dict:
+        """Arguments that protect a file written from this document, if the document was opened with a password.
+        Every file that OpenRevu derives from a protected document (copies, extracts, reports) uses them."""
+        if not self._password:
+            return {}
+        return dict(encryption=fitz.PDF_ENCRYPT_AES_256, user_pw=self._password, owner_pw=self._password + "-owner",
+                    permissions=-1)
+
     def _dump(self) -> bytes:
         """Serialize for the undo history; protected documents never leave plaintext copies in memory."""
         if self._password:
@@ -574,15 +605,27 @@ class Document(SheetOps, PageOps):
                     pass
         return Scale(), {}
 
-    def _store_scales(self):
-        md = dict(self.doc.metadata or {})
-        kw = [p for p in (md.get("keywords") or "").split(";") if p and not p.startswith(TAG + "-scale")]
-        blob = {"default": self.default_scale.to_dict(), "pages": {str(k): v.to_dict() for k, v in self.page_scales.items()},
-                "viewports": [{"page": p, "rect": list(r), "scale": sc.to_dict()} for p, r, sc in self.viewports],
+    def _settings_blob(self, pages=None) -> dict:
+        """The document settings that are stored in the PDF. With `pages` (a list of page indexes), only those pages
+        are kept, renumbered 0, 1, 2... (used when pages are written to a new file)."""
+        keep = {p: i for i, p in enumerate(pages)} if pages is not None else None
+        remap = (lambda p: p) if keep is None else (lambda p: keep[p])
+        return {"default": self.default_scale.to_dict(),
+                "pages": {str(remap(k)): v.to_dict() for k, v in self.page_scales.items() if keep is None or k in keep},
+                "viewports": [{"page": remap(p), "rect": list(r), "scale": sc.to_dict()} for p, r, sc in self.viewports
+                              if keep is None or p in keep],
                 "style": self.unit_style, "fraction": self.fraction, "columns": self.columns}
-        kw.append(f"{TAG}-scales={json.dumps(blob)}")
+
+    def _write_settings(self, target: fitz.Document, pages=None):
+        """Store the settings in the keywords of `target` (this document, or a new file made from some of its pages)."""
+        md = dict(target.metadata or {})
+        kw = [p for p in (md.get("keywords") or "").split(";") if p and not p.startswith(TAG + "-scale")]
+        kw.append(f"{TAG}-scales={json.dumps(self._settings_blob(pages))}")
         md["keywords"] = ";".join(kw)
-        self.doc.set_metadata(md)
+        target.set_metadata(md)
+
+    def _store_scales(self):
+        self._write_settings(self.doc)
 
     @property
     def scale(self) -> Scale:
@@ -607,7 +650,7 @@ class Document(SheetOps, PageOps):
         for m in self.markups():
             r = m.measurement()
             if r and r[0] != "count" and any(c.info.get("subject") == "Label" for c in m._children()):
-                m._remeasure(r[0])
+                m._relabel(r[0])          # only the text changes: a takeoff value is never recomputed by a display setting
                 n += 1
         return n
 
@@ -1063,9 +1106,8 @@ class Document(SheetOps, PageOps):
         if path is None:
             raise ValueError("no path")
         kw = {"garbage": 3, "deflate": True, **opts}
-        if self._password and "encryption" not in kw:
-            kw.update(encryption=fitz.PDF_ENCRYPT_AES_256, user_pw=self._password, owner_pw=self._password + "-owner",
-                      permissions=-1)
+        if "encryption" not in kw:
+            kw.update(self._encryption_kwargs())
         if path == self.path:
             tmp = path + ".tmp"
             self.doc.save(tmp, **kw)

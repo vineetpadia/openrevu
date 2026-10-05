@@ -1063,3 +1063,94 @@ def test_unit_style_survives_undo_of_the_style_change(pdf):
     assert (d.unit_style, d.fraction) == ("decimal", 16)
     d.redo()
     assert (d.unit_style, d.fraction) == ("feet-inches", 8)
+
+
+# ---------- third-review regressions: measurements ----------
+def test_display_style_never_changes_stored_values(pdf):
+    d = Document(pdf)
+    d.set_scale(Scale("ft", 0.1))                                           # page scale
+    d.add_viewport(0, fitz.Rect(0, 0, 400, 400), Scale("ft", 1.0))           # a region with another scale
+    tri = [(10, 10), (310, 10), (10, 190)]
+    d.add_area(0, tri)
+    before = [m.measurement() for m in d.markups()]
+    d.set_unit_style("feet-inches"); d.set_unit_style("decimal")
+    assert [m.measurement() for m in d.markups()] == before                  # the viewport scale still applies
+    assert before[0][1] == pytest.approx(0.5 * 300 * 180)                    # 1 ft/pt inside the viewport
+
+
+def test_scale_change_then_style_change_keeps_value_and_unit_together(pdf):
+    d = Document(pdf)
+    d.set_scale(Scale("ft", 0.1)); d.add_length(0, [(0, 100), (200, 100)])
+    d.set_scale(Scale("m", 0.01))                                           # recalibrated later
+    d.set_unit_style("feet-inches")
+    kind, val, unit = d.markups()[0].measurement()
+    assert (kind, round(val, 6), unit) == ("length", 20.0, "ft")             # still the value that was measured, in its own unit
+    m = d.markups()[0]; r = m.rect
+    m.resize(fitz.Rect(r.x0, r.y0, r.x0 + (r.width - 3) * 2 + 3, r.y1))      # a resize measures again, with the scale in force now
+    kind, val, unit = d.markups()[0].measurement()
+    assert unit == "m" and val == pytest.approx(4.0, rel=0.03)               # and says so
+
+
+def test_labels_keep_the_colour_of_their_markup(pdf):
+    d = Document(pdf)
+    d.set_scale(Scale("m", 0.1)); d.add_area(0, [(0, 0), (100, 0), (100, 100), (0, 100)], color=(0.1, 0.6, 0.2))
+    label = lambda: [x for x in d.markups(include_children=True) if x.subject == "Label"]    # noqa: E731
+    colour = lambda: d.doc.xref_get_key(label()[0].xref, "DA")[1].split(" rg")[0]            # the text colour is in /DA  # noqa: E731
+    assert colour() == "0.1 0.6 0.2"
+    d.set_unit_style("feet-inches"); d.set_unit_style("decimal")
+    assert len(label()) == 1 and colour() == "0.1 0.6 0.2"
+    d.markups()[0].resize(fitz.Rect(0, 0, 150, 150))
+    assert len(label()) == 1 and colour() == "0.1 0.6 0.2"
+
+
+# ---------- third-review regressions: protected documents stay protected ----------
+def test_everything_derived_from_a_protected_document_is_protected(pdf, tmp_path):
+    from tests.test_sheets import SET_V1, make_set
+    d0 = Document(pdf); enc = str(tmp_path / "enc.pdf"); d0.save_encrypted(enc, "pw")
+    d = Document(enc, "pw")
+    d.add_rect(0, fitz.Rect(10, 10, 60, 60)); d.markups()[0].set_comment("secret note")
+    outs = {"optimize": str(tmp_path / "opt.pdf"), "extract": str(tmp_path / "ex.pdf"), "report": str(tmp_path / "rep.pdf")}
+    d.optimize(outs["optimize"]); d.extract_pages([0, 1], outs["extract"]); d.export_markup_summary(outs["report"])
+    parts = d.split(str(tmp_path / "sp"), every=1)
+    for path in list(outs.values()) + parts:
+        f = fitz.open(path)
+        assert f.needs_pass, path                                           # not readable without the password
+        assert f.authenticate("pw") and f.page_count >= 1
+    other = make_set(tmp_path / "new.pdf", SET_V1)
+    from openrevu.compare import compare_documents
+    compare_documents(enc, other, str(tmp_path / "cmp.pdf"), old_password="pw")
+    assert fitz.open(str(tmp_path / "cmp.pdf")).needs_pass
+    # an ordinary document is still written in plain
+    plain = Document(pdf); plain.optimize(str(tmp_path / "p1.pdf")); plain.extract_pages([0], str(tmp_path / "p2.pdf"))
+    assert not fitz.open(str(tmp_path / "p1.pdf")).needs_pass and not fitz.open(str(tmp_path / "p2.pdf")).needs_pass
+
+
+def test_pdfa_of_a_protected_document_says_it_is_not_protected(pdf, tmp_path):
+    from openrevu import pdfa
+    if not pdfa.available():
+        pytest.skip("Ghostscript not installed")
+    enc = str(tmp_path / "enc.pdf"); Document(pdf).save_encrypted(enc, "pw")
+    rep = Document(enc, "pw").export_pdfa(str(tmp_path / "a.pdf"))
+    assert any("not password protected" in w for w in rep.warnings) and not fitz.open(str(tmp_path / "a.pdf")).needs_pass
+
+
+# ---------- third-review regressions: extract and split keep the document settings ----------
+def test_extract_and_split_keep_scales_viewports_columns_and_style(pdf, tmp_path):
+    d = Document(pdf)
+    d.set_scale(Scale("ft", 0.2)); d.set_scale(Scale("m", 0.5), page=2); d.set_scale(Scale("in", 3.0), page=0)
+    d.add_viewport(2, fitz.Rect(0, 0, 100, 100), Scale("mm", 9.0)); d.add_viewport(0, fitz.Rect(5, 5, 50, 50), Scale("cm", 4.0))
+    d.add_column("Cost", "number"); d.set_unit_style("feet-inches", 8)
+    d.add_rect(2, fitz.Rect(10, 10, 60, 60)); d.markups()[0].set_custom("Cost", 7.5)
+    out = d.extract_pages([2, 1], str(tmp_path / "e.pdf"))
+    e = Document(out)
+    assert e.scale_for(0).unit == "m" and e.scale_for(0).unit_per_pt == 0.5          # old page 2 is now page 0
+    assert e.scale_for(1).unit_per_pt == 0.2                                         # old page 1 had no own scale: the default
+    assert [(p, sc.unit) for p, _r, sc in e.viewports] == [(0, "mm")]                # the page-0 viewport was left behind
+    assert e.default_scale.unit_per_pt == 0.2 and e.unit_style == "feet-inches" and e.fraction == 8
+    assert [c["name"] for c in e.columns] == ["Cost"] and e.markups()[0].custom() == {"Cost": 7.5}   # the value is not orphaned
+    parts = d.split(str(tmp_path / "sp"), every=1)
+    firsts = [Document(p) for p in parts]
+    assert [x.scale_for(0).unit for x in firsts] == ["in", "ft", "m"]                # each part knows its own page scale
+    assert [len(x.viewports) for x in firsts] == [1, 0, 1] and firsts[0].viewports[0][2].unit == "cm"
+    # the source document was not changed by writing the extract
+    assert d.scale_for(2).unit == "m" and len(d.viewports) == 2 and len(d._undo) >= 1

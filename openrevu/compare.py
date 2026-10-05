@@ -96,7 +96,8 @@ def diff_text(pa, pb, limit=8):
     tb = [w[4] for w in pb.get_text("words", sort=True)] if pb is not None else []
     added = removed = 0
     notes = []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ta, tb, autojunk=False).get_opcodes():
+    # an exact match is slow on pages with thousands of repeated words, so the quick mode is used for those
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ta, tb, autojunk=len(ta) + len(tb) > 6000).get_opcodes():
         if tag == "equal":
             continue
         old, new = " ".join(ta[i1:i2]), " ".join(tb[j1:j2])
@@ -167,7 +168,10 @@ def compare_documents(old_path, new_path, out_path=None, match="sheet", dpi=100,
     if out is not None:
         if not len(out):
             out.new_page()
-        out.save(out_path, garbage=3, deflate=True)
+        secret = old_password or new_password            # an overlay of protected files is protected too
+        enc = {"encryption": fitz.PDF_ENCRYPT_AES_256, "user_pw": secret, "owner_pw": secret + "-owner",
+               "permissions": -1} if secret else {}
+        out.save(out_path, garbage=3, deflate=True, **enc)
         out.close()
     old.doc.close(); new.doc.close()
     return results

@@ -119,3 +119,19 @@ def test_a_page_that_still_gets_rasterised_is_reported(tmp_path):
         assert any("lost its selectable text" in w for w in rep.warnings) and "Warning:" in rep.summary()
     ok2b = d.export_pdfa(str(tmp_path / "w2.pdf"), "2b")
     assert ok2b.compliant and "Keep me" in fitz.open(str(tmp_path / "w2.pdf"))[0].get_text()
+
+
+@needs_gs
+def test_dropped_links_and_turned_pages_are_reported(tmp_path):
+    d = Document(); p = d.doc.new_page(width=612, height=792); p.insert_text((72, 100), "Hello", fontsize=14)
+    d.doc.new_page(width=612, height=792); d.doc[1].set_rotation(90); d.doc[1].insert_text((72, 100), "Rotated", fontsize=14)
+    d.add_link_uri(0, fitz.Rect(72, 90, 120, 110), "https://example.org")
+    d.add_link_goto(0, fitz.Rect(72, 200, 120, 220), 1)
+    rep = d.export_pdfa(str(tmp_path / "a.pdf"), "2b")
+    out = fitz.open(str(tmp_path / "a.pdf"))
+    kept = sum(len(pg.get_links()) for pg in out)
+    if kept < 2:
+        assert any("link(s) were removed" in w for w in rep.warnings)          # never silent
+    assert "Warning:" in rep.summary() or kept == 2 or not rep.warnings
+    if abs(out[1].rect.width - d.doc[1].rect.width) > 1:
+        assert any("page 2 was turned" in w for w in rep.warnings)

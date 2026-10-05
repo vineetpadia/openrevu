@@ -9,12 +9,16 @@ checked against files from every Bluebeam version. Items that it cannot read are
 silently dropped, and a damaged file never stops the import of the other items."""
 from __future__ import annotations
 
+import math
 import re
 import xml.etree.ElementTree as ET
 import zlib
 from dataclasses import dataclass, field
 
 DEFAULT_SIZE = (120.0, 60.0)
+MAX_DATA = 4_000_000        # bytes of decompressed data for one tool. A real tool is a few hundred bytes.
+MAX_DEPTH = 40              # nesting of arrays and dictionaries
+MAX_COORD = 1_000_000.0     # points; a page is about 1000 points wide
 _WS = b" \t\r\n\x0c\x00"
 _DELIM = b"()<>[]{}/%"
 
@@ -36,7 +40,7 @@ class _Reader:
     """A small reader for PDF object syntax: dictionaries, arrays, names, numbers, strings."""
 
     def __init__(self, data: bytes):
-        self.d, self.i = data, 0
+        self.d, self.i, self.depth = data, 0, 0
 
     def _skip(self):
         d = self.d
@@ -54,13 +58,17 @@ class _Reader:
         if self.i >= len(self.d):
             raise ValueError("unexpected end of data")
         c = self.d[self.i:self.i + 1]
+        if (self.d[self.i:self.i + 2] == b"<<" or c == b"[") and self.depth >= MAX_DEPTH:
+            raise ValueError("the data is nested too deeply")
         if self.d[self.i:self.i + 2] == b"<<":
             self.i += 2
+            self.depth += 1
             out: dict = {}
             while True:
                 self._skip()
                 if self.d[self.i:self.i + 2] == b">>":
                     self.i += 2
+                    self.depth -= 1
                     return out
                 key = self.parse()
                 if not isinstance(key, Name):
@@ -68,11 +76,13 @@ class _Reader:
                 out[str(key)] = self.parse()
         if c == b"[":
             self.i += 1
+            self.depth += 1
             arr = []
             while True:
                 self._skip()
                 if self.d[self.i:self.i + 1] == b"]":
                     self.i += 1
+                    self.depth -= 1
                     return arr
                 arr.append(self.parse())
         if c == b"/":
@@ -104,9 +114,11 @@ class _Reader:
         if tok == "null":
             return None
         try:
-            num = float(tok) if "." in tok else int(tok)
+            num = float(tok) if ("." in tok or "e" in tok.lower()) else int(tok)
         except ValueError:
             return Name(tok)  # an operator or unknown word: keep it as a name, never fail
+        if isinstance(num, float) and not math.isfinite(num):
+            raise ValueError("a number is out of range")
         # an indirect reference looks like "12 0 R": skip it
         m = re.match(rb"\s+\d+\s+R\b", self.d[self.i:self.i + 20])
         if isinstance(num, int) and m:
@@ -186,10 +198,14 @@ def decode_raw(text: str) -> bytes:
         raw = bytes.fromhex(s)
         if raw[:1] == b"\x78":                      # zlib header
             try:
-                return zlib.decompress(raw)
+                dec = zlib.decompressobj()
+                data = dec.decompress(raw, MAX_DATA + 1)
             except zlib.error as e:
                 raise ValueError(f"the compressed data is damaged ({e})") from None
-        return raw
+            if len(data) > MAX_DATA or dec.unconsumed_tail:
+                raise ValueError("the tool data is far larger than a real tool; the item was not read")
+            return data
+        return raw[:MAX_DATA + 1] if len(raw) <= MAX_DATA else (_ for _ in ()).throw(ValueError("the tool data is too large"))
     return (text or "").encode("latin-1", "replace")
 
 
@@ -203,11 +219,22 @@ def _gray_or_rgb(v):
     return _rgb(v)
 
 
+def _check_range(*groups):
+    """Raise ValueError if a number is not finite or is far outside any page."""
+    for g in groups:
+        for v in (g if isinstance(g, list) else [g]):
+            if isinstance(v, list):
+                _check_range(v)
+            elif isinstance(v, (int, float)) and not isinstance(v, bool) and (not math.isfinite(v) or abs(v) > MAX_COORD):
+                raise ValueError("a coordinate is outside the possible range")
+
+
 def tool_from_annotation(d: dict) -> dict:
     """Map a Bluebeam annotation dictionary to a Tool Chest preset (the form Document.add_from_dict reads).
     Raises ValueError with the reason if the kind of markup cannot be recreated."""
     sub = str(d.get("Subtype", ""))
     it = str(d.get("IT", ""))
+    _check_range(d.get("Rect"), d.get("L"), d.get("Vertices"), d.get("InkList"))
     kind = {"Square": "Square", "Circle": "Circle", "Line": "Line", "PolyLine": "PolyLine", "Polygon": "Polygon",
             "Ink": "Ink", "FreeText": "FreeText", "Text": "Text"}.get(sub)
     if kind is None:
@@ -304,6 +331,6 @@ def read_btx(path: str):
             if raw is None:
                 raise ValueError("the item has no <Raw> data")
             tools.append((name, tool_from_annotation(parse_annotation(decode_raw(raw)))))
-        except ValueError as e:
-            skipped.append((name, str(e)))
+        except (ValueError, RecursionError, MemoryError, OverflowError) as e:   # one bad item never stops the others
+            skipped.append((name, str(e) if isinstance(e, ValueError) else "the item could not be read"))
     return title, tools, skipped

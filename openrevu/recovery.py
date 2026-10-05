@@ -76,37 +76,53 @@ def remove(doc_id: str) -> None:
             pass
 
 
-def entries() -> list[dict]:
-    """Snapshots left by sessions that are no longer running, newest first. Each has the keys of the
-    metadata file plus "file" (the snapshot PDF). Damaged entries are removed."""
+def _valid(m) -> bool:
+    return (isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"].isalnum()
+            and isinstance(m.get("pid"), int) and not isinstance(m["pid"], bool)
+            and isinstance(m.get("time"), (int, float)) and isinstance(m.get("title", ""), str))
+
+
+def entries(own_ids=()) -> list[dict]:
+    """Snapshots that this session may offer, newest first. Each has the keys of the metadata file plus "file"
+    (the snapshot PDF). Not offered: snapshots of documents that are open in this session (own_ids), and snapshots
+    of another OpenRevu that is still running. Damaged entries and old leftovers are removed."""
     out = []
     d = recovery_dir()
-    for name in os.listdir(d):
+    names = os.listdir(d)
+    for name in names:
         if not name.endswith(".json"):
             continue
         meta_path = os.path.join(d, name)
         try:
             with open(meta_path, encoding="utf-8") as f:
                 m = json.load(f)
+            if not _valid(m):
+                raise ValueError("not a snapshot description")
             pdf = os.path.join(d, m["id"] + ".pdf")
             if not os.path.exists(pdf):
                 raise ValueError("missing snapshot")
-        except (OSError, ValueError, KeyError):
-            try:
-                os.remove(meta_path)
-            except OSError:
-                pass
+        except (OSError, ValueError):        # includes a JSON file that holds a list, null, or other types
+            for p in (meta_path, os.path.join(d, name[:-5] + ".pdf")):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
             continue
-        if m.get("pid") != os.getpid() and pid_alive(int(m.get("pid", 0))):
-            continue                       # another running OpenRevu owns this one
-        if m.get("pid") == os.getpid():
-            continue                       # our own snapshot
+        if m["id"] in own_ids:
+            continue                         # a document that is open in this session
+        if m["pid"] != os.getpid() and pid_alive(m["pid"]):
+            continue                         # another running OpenRevu owns this one
         m["file"] = pdf
         out.append(m)
-    for name in os.listdir(d):             # leftovers of an interrupted write
-        if name.endswith(".tmp"):
-            try:
-                os.remove(os.path.join(d, name))
-            except OSError:
-                pass
+    now = time.time()
+    for name in names:                       # leftovers: an interrupted write, or a snapshot without its description
+        path = os.path.join(d, name)
+        try:
+            stale = now - os.path.getmtime(path) > 600       # a live session may be writing right now: wait ten minutes
+            if name.endswith(".tmp") and stale:
+                os.remove(path)
+            elif name.endswith(".pdf") and not os.path.exists(os.path.join(d, name[:-4] + ".json")) and stale:
+                os.remove(path)
+        except OSError:
+            pass
     return sorted(out, key=lambda m: -m.get("time", 0))

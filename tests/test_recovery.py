@@ -93,12 +93,14 @@ def test_crash_then_restart_restores_the_unsaved_work(app, pdf, tmp_path, isolat
     assert w2.tabs.count() == 1 and w2.tabs.tabText(0) == "*work.pdf (recovered)"
     d = w2.doc
     assert d.path is None and d.modified and len(d.markups()) == 2 and d.scale.unit == "m"       # the work and the scale are back
-    assert files(isolated_recovery_dir) == []                                                    # taken over by the new session
+    assert len(files(isolated_recovery_dir)) == 2                                                # kept until the work is saved or closed
+    assert w2.autosave_now() == 1 and recovery.entries({w2.doc.recovery_id}) == []               # re-written under this session
     assert open(pdf, "rb").read() == original_bytes                                              # the original file is untouched
     shown = {}
     monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", staticmethod(lambda p, t, start, *a, **k: (shown.update(start=start) or str(tmp_path / "restored.pdf"), "")))
     w2.save()
     assert shown["start"] == pdf and len(Document(str(tmp_path / "restored.pdf")).markups()) == 2   # the dialog starts at the original name
+    assert files(isolated_recovery_dir) == []                                                    # saved: the snapshot is no longer needed
 
 
 def test_discard_and_ask_later(app, pdf, isolated_recovery_dir, monkeypatch):
@@ -113,7 +115,7 @@ def test_discard_and_ask_later(app, pdf, isolated_recovery_dir, monkeypatch):
 
 def test_a_live_session_and_our_own_snapshots_are_not_offered(app, pdf, isolated_recovery_dir):
     w = Main(pdf); w.doc.add_rect(0, fitz.Rect(10, 10, 60, 60)); w._after_change(); w.autosave_now()
-    assert recovery.entries() == []                                                    # our own process
+    assert recovery.entries({w.doc.recovery_id}) == []                                 # a document that is open here
     for name in os.listdir(isolated_recovery_dir):
         if name.endswith(".json"):
             p = os.path.join(isolated_recovery_dir, name)
@@ -153,6 +155,8 @@ def test_damaged_snapshots_are_cleaned_up_not_offered(app, isolated_recovery_dir
     json.dump({"id": "c", "pid": 999999991, "title": "bad", "time": 2, "path": None}, open(os.path.join(d, "c.json"), "w"))
     open(os.path.join(d, "c.pdf"), "wb").write(b"%PDF-1.4 this is not a real pdf")
     open(os.path.join(d, "stale.pdf.tmp"), "wb").write(b"half")
+    old = os.path.getmtime(os.path.join(d, "stale.pdf.tmp")) - 3600
+    os.utime(os.path.join(d, "stale.pdf.tmp"), (old, old))
     ents = recovery.entries()
     assert [e["id"] for e in ents] == ["c"] and "a.json" not in files(d) and "b.json" not in files(d) and "stale.pdf.tmp" not in files(d)
     w = Main(); choose(monkeypatch, "Recover")
@@ -177,3 +181,44 @@ def test_timer_runs_autosave(app, pdf, isolated_recovery_dir, monkeypatch):
     while time.time() - t0 < 3 and not files(isolated_recovery_dir):
         app.processEvents(); time.sleep(0.02)
     assert len(files(isolated_recovery_dir)) == 2
+
+
+# ---------- third-review regressions ----------
+@pytest.mark.parametrize("content", ["[]", "null", "42", '"text"', '{"id": "x"}', '{"id": "x", "pid": null, "time": 1}',
+                                      '{"id": "../evil", "pid": 999999991, "time": 1}', '{"id": "ab", "pid": true, "time": 1}',
+                                      '{"id": "ab", "pid": 999999991, "time": "yesterday"}'])
+def test_odd_descriptions_are_removed_and_never_break_recovery(app, isolated_recovery_dir, content):
+    d = recovery.recovery_dir()
+    open(os.path.join(d, "bad.json"), "w").write(content)
+    open(os.path.join(d, "bad.pdf"), "wb").write(b"x")
+    assert recovery.entries() == []                                  # no exception
+    assert "bad.json" not in files(d) and "bad.pdf" not in files(d)  # removed, so it cannot break the next start either
+    assert recovery.entries() == []
+
+
+def test_a_snapshot_with_our_own_pid_but_an_unknown_id_is_offered(app, pdf, isolated_recovery_dir):
+    """A restarted process (a container, a reused pid) must still see what its predecessor left."""
+    w = Main(pdf); w.doc.add_rect(0, fitz.Rect(10, 10, 60, 60)); w._after_change(); w.autosave_now()
+    assert recovery.entries({w.doc.recovery_id}) == [] and len(recovery.entries()) == 1          # open here, or not
+    assert len(recovery.entries({"someotherid"})) == 1                                           # same pid, not ours: offered
+
+
+def test_orphan_files_are_cleaned_only_when_old(app, isolated_recovery_dir):
+    d = recovery.recovery_dir()
+    for name in ("fresh.pdf", "old.pdf", "fresh.pdf.tmp", "old.pdf.tmp"):
+        open(os.path.join(d, name), "wb").write(b"x")
+    old = os.path.getmtime(os.path.join(d, "old.pdf")) - 3600
+    for name in ("old.pdf", "old.pdf.tmp"):
+        os.utime(os.path.join(d, name), (old, old))
+    recovery.entries()
+    assert files(d) == ["fresh.pdf", "fresh.pdf.tmp"]                # a live session may be writing: young files stay
+
+
+def test_recovered_work_survives_a_second_crash(app, pdf, tmp_path, isolated_recovery_dir, monkeypatch):
+    w = Main(pdf); w.doc.add_rect(0, fitz.Rect(10, 10, 60, 60)); w._after_change(); w.autosave_now(); crash(w)
+    as_dead_session(isolated_recovery_dir)
+    w2 = Main(); choose(monkeypatch, "Recover"); assert w2.offer_recovery() == 1
+    crash(w2)                                                         # the new session dies before its first autosave
+    as_dead_session(isolated_recovery_dir)
+    w3 = Main(); choose(monkeypatch, "Recover")
+    assert w3.offer_recovery() == 1 and len(w3.doc.markups()) == 1    # the work is still there

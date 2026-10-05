@@ -148,3 +148,23 @@ def test_the_panel_is_widened_so_every_column_is_visible(app, tmp_path):
     assert w.sheets_table.columnWidth(2) >= 80                                       # the title keeps a usable width
     w.resizeDocks([w.left_dock], [230], QtCore.Qt.Horizontal); app.processEvents()
     assert not w.sheets_table.horizontalScrollBar().isVisible()                    # and when the panel is narrow
+
+
+def test_compare_asks_for_the_password_of_the_new_version(win, tmp_path, monkeypatch):
+    from openrevu.core import Document as D
+    w = win
+    new = make_set(tmp_path / "new.pdf", SET_V1); enc = str(tmp_path / "new_enc.pdf"); D(new).save_encrypted(enc, "pw2")
+    out = str(tmp_path / "ov.pdf")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (enc, "")))
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (out, "")))
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", staticmethod(lambda *a, **k: ("By sheet number", True)))
+    asked = []
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: asked.append(a[2]) or ("pw2", True)))
+    seen = {}
+    monkeypatch.setattr(QtWidgets.QDialog, "exec_", lambda self: seen.update(rows=self.results_table.rowCount()) or 0)
+    w.compare()
+    assert asked == ["Password for the new version:"] and seen["rows"] == 3 and os.path.exists(out)
+    asked.clear()
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", staticmethod(lambda *a, **k: ("", False)))      # the user cancels
+    seen.clear(); w.compare()
+    assert not seen                                                               # no results dialog

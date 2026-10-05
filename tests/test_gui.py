@@ -621,3 +621,55 @@ def test_long_markup_text_is_readable_in_a_tooltip(win):
     item = w.mk_table.item(0, 5)
     assert item.toolTip() == "A very long comment " * 20 and w.mk_table.textElideMode() == QtCore.Qt.ElideRight
     assert w.mk_table.columnWidth(5) >= 200
+
+
+def test_custom_numbers_round_trip_and_losing_focus_changes_nothing(win):
+    from openrevu.gui import custom_text
+    assert [custom_text(v) for v in (1234567.0, 0.1, 12.5, 1e20, None, "", "text", 3, 1e-7, 123456789012345678.0)] == [
+        "1234567", "0.1", "12.5", "1e+20", "", "", "text", "3", "1e-07", "1.2345678901234568e+17"]
+    w = win
+    w.doc.add_column("Qty", "number"); w.doc.add_rect(0, fitz.Rect(10, 10, 60, 60)); w._after_change()
+    w.cv.select(w.doc.markups()[0])
+    ed = w.p_custom_editors["Qty"][1]
+    ed.setText("1234567"); ed.editingFinished.emit()
+    assert w.doc.markups()[0].custom()["Qty"] == 1234567.0 and ed.text() == "1234567"
+    w._load_props()
+    assert ed.text() == "1234567"                                           # not 1.23457e+06
+    steps, modified = len(w.doc._undo), w.doc.modified
+    for _ in range(3):
+        ed.editingFinished.emit()                                           # focus out with no change
+    assert w.doc.markups()[0].custom()["Qty"] == 1234567.0                  # the value is exact
+    assert len(w.doc._undo) == steps and w.doc.modified == modified         # and no undo step was added
+    row = [w.mk_table.item(0, c).text() for c in range(w.mk_table.columnCount())]
+    assert row[-1] == "1234567"
+    ed.setText("1234568"); ed.editingFinished.emit()
+    assert w.doc.markups()[0].custom()["Qty"] == 1234568.0 and len(w.doc._undo) == steps + 1
+
+
+# ---------- third-review regressions: straight drags ----------
+@pytest.mark.parametrize("tool", ["Rectangle", "Ellipse", "Cloud", "Highlight", "Underline", "Strikeout", "Squiggly", "Text", "Callout",
+                                  "Redact", "RectArea", "EllipseArea", "Viewport", "Snapshot", "CopyText", "Link", "Image", "Stamp", "Signature"])
+@pytest.mark.parametrize("a,b", [((100, 150), (260, 150)), ((100, 150), (100, 320))])        # exactly horizontal, exactly vertical
+def test_a_straight_drag_gives_a_message_not_an_error(win, tool, a, b):
+    if tool in ("Stamp", "Signature", "Image") and a[0] == b[0]:
+        pytest.skip("a drag narrower than 20 points is a click for these tools (tested separately)")
+    w = win                                       # a dialog or an unhandled exception would fail the test (see conftest)
+    n = len(w.doc.markups())
+    w.set_tool(tool); drag(w, 0, a, b)
+    assert len(w.doc.markups()) == n and "width and some height" in w.statusBar().currentMessage()
+    assert w.doc.viewports == [] and w.doc.links(0) == []
+
+
+def test_straight_drags_still_work_for_tools_that_need_no_area(win):
+    w = win
+    for tool in ("Line", "Arrow"):
+        w.set_tool(tool); drag(w, 0, (100, 150), (260, 150))
+    w.set_tool("Length"); w.doc.set_scale(__import__("openrevu.core", fromlist=["Scale"]).Scale("ft", 1 / 12))
+    assert [m.kind for m in w.doc.markups()] == ["Line", "Line"]
+
+
+def test_a_narrow_drag_places_stamps_and_signatures_like_a_click(win):
+    w = win
+    w.set_tool("Stamp"); drag(w, 0, (100, 150), (100, 320))
+    w.set_tool("Signature"); drag(w, 0, (300, 150), (300, 320))
+    assert sorted(m.subject for m in w.doc.markups()) == ["Signature", "Stamp"]

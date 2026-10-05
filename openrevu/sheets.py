@@ -55,6 +55,8 @@ class SlipReport:
     added: list = field(default_factory=list)          # sheet numbers appended at the end
     not_in_new: list = field(default_factory=list)     # old sheets that the new file does not contain (kept)
     size_changed: list = field(default_factory=list)   # (sheet number, old size, new size): markups may not line up
+    rotation_changed: list = field(default_factory=list)   # (sheet number, old rotation, new rotation): markups may not line up
+    duplicate_numbers: list = field(default_factory=list)  # numbers of added sheets that were already in use (stored without a number)
     markups_moved: int = 0
 
     def summary(self) -> str:
@@ -62,6 +64,11 @@ class SlipReport:
                  f"{len(self.not_in_new)} not in the new file (kept)"]
         if self.size_changed:
             parts.append(f"{len(self.size_changed)} with a different page size (check the markups)")
+        if self.rotation_changed:
+            parts.append(f"{len(self.rotation_changed)} with a different page rotation (check the markups)")
+        if self.duplicate_numbers:
+            parts.append(f"{len(self.duplicate_numbers)} added without a number because it was already used "
+                         f"({', '.join(self.duplicate_numbers)})")
         return ", ".join(parts) + f"; {self.markups_moved} markup(s) carried over."
 
 
@@ -98,7 +105,7 @@ class SheetOps:
         """number, title, discipline, revisions for a page. A stored value wins over a detected one."""
         rec = self.sheet_record(pno)
         number, title = rec.get("number"), rec.get("title", "")
-        if detect and not number:
+        if detect and not number and not rec.get("unnumbered"):      # "unnumbered": the number was deliberately left out
             number, dtitle = self._detect(pno)
             title = title or dtitle
         return {"number": number or "", "title": title or "", "discipline": rec.get("discipline", ""),
@@ -111,6 +118,7 @@ class SheetOps:
         for name, value in (("number", number), ("title", title), ("discipline", discipline)):
             if value is not None:
                 if name == "number" and value.strip():
+                    rec.pop("unnumbered", None)
                     clash = [i for i in range(len(self.doc)) if i != pno and self.sheet_info(i)["number"] == value.strip()]
                     if clash:
                         raise ValueError(f"sheet number {value.strip()!r} is already used on page {clash[0] + 1}")
@@ -121,10 +129,11 @@ class SheetOps:
     def detect_sheets(self, pattern=None, corner=None, overwrite=False) -> int:
         """Store the detected number and title of each page. Existing values stay unless overwrite is true."""
         done, seen = 0, {}
+        found = [self._detect(i, pattern, corner) for i in range(len(self.doc))]   # read everything first: a failure changes nothing
         for i in range(len(self.doc)):
             rec = read_record(self.doc, i)
-            number, title = self._detect(i, pattern, corner)
-            if (overwrite or not rec.get("number")) and number:
+            number, title = found[i]
+            if (overwrite or not (rec.get("number") or rec.get("unnumbered"))) and number:
                 if number in seen:       # two pages with the same number: do not store the second one
                     continue
                 rec["number"] = number
@@ -265,6 +274,8 @@ class SheetOps:
             if abs(old_rect.width - new_rect.width) > 1 or abs(old_rect.height - new_rect.height) > 1:
                 rep.size_changed.append((num, (round(old_rect.width), round(old_rect.height)),
                                          (round(new_rect.width), round(new_rect.height))))
+            if self.doc[i].rotation != new.doc[j].rotation:   # markups are stored in the unrotated page space
+                rep.rotation_changed.append((num, self.doc[i].rotation, new.doc[j].rotation))
             self.doc.insert_pdf(new.doc, from_page=j, to_page=j, start_at=i + 1)
             old_x, new_x = self.doc.page_xref(i), self.doc.page_xref(i + 1)
             rec = read_record(self.doc, i) or {}
@@ -287,6 +298,7 @@ class SheetOps:
         for pos in range(len(asc) - 1, -1, -1):
             self.doc.delete_page(asc[pos][0] + pos)
         rep.replaced.reverse()
+        in_use = {self.sheet_info(i)["number"] for i in range(len(self.doc)) if self.sheet_info(i)["number"]}
         for j, num in added:
             at = len(self.doc)
             self.doc.insert_pdf(new.doc, from_page=j, to_page=j, start_at=at)
@@ -294,6 +306,12 @@ class SheetOps:
             rec = read_record(new.doc, j)
             rec.setdefault("number", info["number"])
             rec.setdefault("title", info["title"])
+            if rec.get("number") in in_use:       # two sheets with one number would make the next slip sheet fail
+                rep.duplicate_numbers.append(rec["number"])
+                num = rec.pop("number")
+                rec["unnumbered"] = True              # keep it from being detected again from its text
+            elif rec.get("number"):
+                in_use.add(rec["number"])
             write_record(self.doc, at, {k: v for k, v in rec.items() if v not in ("", None, [])})
             rep.added.append(num)
         rep.not_in_new = [self.sheet_info(i)["number"] or f"page {i + 1}" for i in range(n_old) if i not in {p[0] for p in pairs}]
@@ -320,11 +338,13 @@ class SheetOps:
         return sum(1 for x, t in moved if top_level(x, t))
 
     def _retarget_destinations(self, mapping: dict) -> None:
-        """Rewrite /Dest and /D arrays that start with an old page reference."""
+        """Rewrite every destination array that starts with an old page reference: /Dest, /D, named destinations,
+        and /OpenAction. A destination has the shape [page /XYZ ...] or [page /Fit...]; the page tree's /Kids array
+        does not, so it is left alone."""
         if not mapping:
             return
         olds = "|".join(str(k) for k in mapping)
-        pat = re.compile(r"(/Dest\s*|/D\s*)\[\s*(%s) 0 R" % olds)
+        pat = re.compile(r"(\[\s*)(%s)( 0 R\s*/(?:XYZ|Fit\w*))" % olds)
         for x in range(1, self.doc.xref_length()):
             try:
                 if self.doc.xref_is_stream(x):
@@ -332,7 +352,7 @@ class SheetOps:
                 obj = self.doc.xref_object(x, compressed=False)
             except Exception:
                 continue
-            if "/Dest" in obj or "/D" in obj:
-                new = pat.sub(lambda m: f"{m.group(1)}[{mapping[int(m.group(2))]} 0 R", obj)
+            if " 0 R" in obj and "/XYZ" in obj or "/Fit" in obj:
+                new = pat.sub(lambda m: f"{m.group(1)}{mapping[int(m.group(2))]}{m.group(3)}", obj)
                 if new != obj:
                     self.doc.update_object(x, new)

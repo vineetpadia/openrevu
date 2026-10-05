@@ -117,7 +117,8 @@ class PageOps:
         for p in pnos:
             out.insert_pdf(self.doc, from_page=p, to_page=p)
         copy_records(self.doc, pnos, out, 0)
-        out.save(out_path, garbage=3, deflate=True)
+        self._write_settings(out, list(pnos))      # scales, viewports, custom columns, and the unit style go with the pages
+        out.save(out_path, garbage=3, deflate=True, **self._encryption_kwargs())   # a protected document stays protected
         return out_path
 
     def split(self, out_dir, every=None, ranges=None, prefix="part"):
@@ -362,7 +363,20 @@ class PageOps:
             before = [pg.get_text().strip() for pg in tmpdoc]
             tmpdoc.close()
             rep = pdfa.convert(src, path, level)
+            if self._password:
+                rep.warnings.append("the PDF/A copy is not password protected, because PDF/A does not allow encryption. "
+                                    "Keep the file in a safe place.")
             out = fitz.open(path)
+            links_before = sum(len(self.links(i)) for i in range(len(self.doc)))
+            links_after = sum(len(pg.get_links()) for pg in out)
+            if links_after < links_before:
+                rep.warnings.append(f"{links_before - links_after} link(s) were removed: Ghostscript does not keep links in "
+                                    "PDF/A output.")
+            for i in range(min(len(out), len(self.doc))):
+                a_, b_ = self.doc[i].rect, out[i].rect
+                if abs(a_.width - b_.width) > 1 or abs(a_.height - b_.height) > 1:
+                    rep.warnings.append(f"page {i + 1} was turned: it is {b_.width:.0f} x {b_.height:.0f} points in the copy "
+                                        f"and was {a_.width:.0f} x {a_.height:.0f}.")
             for i, text in enumerate(before):
                 if text and i < len(out) and not out[i].get_text().strip():
                     rep.warnings.append(f"page {i + 1} lost its selectable text (it was drawn as an image). "
@@ -391,13 +405,14 @@ class PageOps:
         """Write a PDF report of the markups (page, subject, author, status, comment, replies, measurement,
         custom columns, and a picture). statuses limits the report, for example ["Accepted"]. Returns the count."""
         from .report import markup_summary_pdf
-        return markup_summary_pdf(self, path, include_images, statuses)
+        return markup_summary_pdf(self, path, include_images, statuses, encryption=self._encryption_kwargs())
 
     def optimize(self, path):
         """Save with maximum structural compression; returns (before, after) byte sizes."""
         self._store_scales()
         before = len(self.doc.tobytes())
-        self.doc.save(path, garbage=4, clean=True, deflate=True, deflate_images=True, deflate_fonts=True)
+        self.doc.save(path, garbage=4, clean=True, deflate=True, deflate_images=True, deflate_fonts=True,
+                      **self._encryption_kwargs())
         return before, os.path.getsize(path)
 
     # ---- forms ----

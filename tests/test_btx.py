@@ -144,3 +144,49 @@ def test_importing_twice_keeps_both_and_a_failed_import_changes_nothing(tmp_path
     only_bad = write(tmp_path, [item("S", "<</Subtype/Stamp>>")], name="s.btx")
     r = chest.import_btx(only_bad)
     assert r.imported == [] and len(r.skipped) == 1 and sorted(chest.items) == ["Rect", "Rect (2)"]
+
+
+# ---------- third-review regressions: hostile or damaged files ----------
+def test_a_zlib_bomb_is_refused_without_using_the_memory(tmp_path):
+    bomb = zlib.compress(b"A" * 200_000_000, 9).hex()                       # 200 MB of data in about 200 KB
+    p = tmp_path / "bomb.btx"
+    p.write_text(f"<BluebeamRevuToolSet><ToolChestItem><Name>Bomb</Name><Raw>{bomb}</Raw></ToolChestItem>"
+                 + item("Ok", RECT) + "</BluebeamRevuToolSet>")
+    import tracemalloc
+    tracemalloc.start()
+    _title, tools, skipped = read_btx(str(p))
+    peak = tracemalloc.get_traced_memory()[1]; tracemalloc.stop()
+    assert [n for n, _ in tools] == ["Ok"] and "far larger" in dict(skipped)["Bomb"]
+    assert peak < 60_000_000                                                  # nothing like 200 MB was built
+    with pytest.raises(ValueError, match="too large"):
+        decode_raw("00" * (btx.MAX_DATA + 1))
+
+
+def test_deep_nesting_is_one_skipped_item_not_a_crash(tmp_path):
+    deep = "<</Subtype/Square/X" + "[" * 5000 + "]" * 5000 + ">>"
+    p = write(tmp_path, [item("Deep", deep), item("Ok", RECT), item("DeepDict", "<</Subtype/Square" + "/K<<" * 3000 + ">>" * 3000 + ">>")])
+    _t, tools, skipped = read_btx(p)
+    assert [n for n, _ in tools] == ["Ok"] and len(skipped) == 2 and all("nested too deeply" in why for _n, why in skipped)
+    assert parse_annotation(b"<</A [[[[1]]]]>>")["A"] == [[[[1]]]]            # ordinary nesting is fine
+
+
+@pytest.mark.parametrize("pdf_text", [
+    "<</Subtype/Square/Rect[0 0 1e999 5]>>", "<</Subtype/Square/Rect[0 0 5000000 5]>>",
+    "<</Subtype/Line/L[0 0 1e9 5]>>", "<</Subtype/Polygon/Vertices[0 0 5 5 -9e9 0]>>", "<</Subtype/Ink/InkList[[0 0 1e300 5]]>>",
+])
+def test_absurd_coordinates_are_refused(pdf_text, tmp_path):
+    _t, tools, skipped = read_btx(write(tmp_path, [item("X", pdf_text)]))
+    assert tools == [] and "range" in skipped[0][1]
+
+
+def test_xml_entity_bomb_is_rejected(tmp_path):
+    p = tmp_path / "xxe.btx"
+    p.write_text('<?xml version="1.0"?><!DOCTYPE l [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
+                 '<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;"><!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">'
+                 '<!ENTITY e "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;"><!ENTITY f "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;"><!ENTITY g "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;"><!ENTITY h "&g;&g;&g;&g;&g;&g;&g;&g;&g;&g;">]>'
+                 '<BluebeamRevuToolSet><ToolChestItem><Name>&h;</Name></ToolChestItem></BluebeamRevuToolSet>')
+    try:
+        _t, tools, skipped = read_btx(str(p))
+        assert len(skipped[0][0]) < 10_000_000                                    # if it is read at all, it stays small
+    except ValueError:
+        pass                                                                      # or it is refused: both are fine

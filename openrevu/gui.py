@@ -65,6 +65,15 @@ QTreeWidget::item { padding: 3px 0; }
 """
 
 
+def custom_text(v) -> str:
+    """A custom column value as text that reads back to the same value (1234567 is not shown as 1.23457e+06)."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() and abs(v) < 1e15 else repr(v)
+    return str(v)
+
+
 class Prefs:
     """User preferences (recent files, window layout). Kept in memory when OPENREVU_NO_SETTINGS is set."""
 
@@ -229,7 +238,8 @@ class Main(DocumentOps, W.QMainWindow):
 
     def offer_recovery(self) -> int:
         """After a crash: offer to restore the documents that had unsaved changes. Returns how many were restored."""
-        found = recovery.entries()
+        own = {self.tabs.widget(i).doc.recovery_id for i in range(self.tabs.count()) if isinstance(self.tabs.widget(i), Canvas)}
+        found = recovery.entries(own)
         if not found:
             return 0
         names = "\n".join(f"  {m['title']}  ({time.strftime('%Y-%m-%d %H:%M', time.localtime(m['time']))})" for m in found)
@@ -271,7 +281,8 @@ class Main(DocumentOps, W.QMainWindow):
             d.modified = True
             self._attach(d, f"{m['title']} (recovered)")
             self.tabs.setTabText(self.tabs.currentIndex(), self._title())
-            recovery.remove(m["id"])
+            d.recovery_id = m["id"]              # keep the snapshot until the user saves or closes: a second crash must not lose it
+            self._autosave_rev[m["id"]] = -1     # and write a fresh one (with this session's id) at the next autosave
             n += 1
         return n
 
@@ -282,10 +293,14 @@ class Main(DocumentOps, W.QMainWindow):
 
     def _run(self, fn, *a, structural=False, msg=None, **kw):
         """Run a document operation. Show errors in a dialog and refresh the window."""
+        gen = self.cv.doc.generation
         try:
             r = fn(*a, **kw)
         except ERRORS as e:
             W.QMessageBox.warning(self, "OpenRevu", str(e))
+            if self.cv.doc.generation != gen:      # the failed operation was rolled back: the page objects are new
+                self.cv.reload()
+                self._after_change()
             return None
         if structural:
             self.cv.reload()
@@ -1159,7 +1174,7 @@ class Main(DocumentOps, W.QMainWindow):
                 val = d.fmt(*r) if r else ""
                 cv = m.custom()
                 row = [str(m.page_no + 1), m.subject, m.kind, m.author, status, m.comment, val] \
-                    + [("%g" % cv[c["name"]]) if isinstance(cv.get(c["name"]), float) else str(cv.get(c["name"], "")) for c in cols]
+                    + [custom_text(cv.get(c["name"])) for c in cols]
                 if q and q not in " ".join(row).lower():
                     continue
                 i = t.rowCount()
@@ -1368,8 +1383,7 @@ class Main(DocumentOps, W.QMainWindow):
                     self.p_replies.addItem(f"{a}: {t}")
                 cv = m.custom()
                 for name, (col, ed) in self.p_custom_editors.items():
-                    val = cv.get(name, "")
-                    val = "%g" % val if isinstance(val, float) else str(val)
+                    val = custom_text(cv.get(name, ""))
                     ed.blockSignals(True)
                     (ed.setCurrentText if isinstance(ed, W.QComboBox) else ed.setText)(val)
                     ed.blockSignals(False)
@@ -1418,13 +1432,20 @@ class Main(DocumentOps, W.QMainWindow):
             if col["type"] == "choice":
                 ed = W.QComboBox()
                 ed.addItems([""] + col["choices"])
-                ed.activated.connect(lambda _i, n=col["name"], e=ed: self._prop(lambda m: m.set_custom(n, e.currentText())))
+                ed.activated.connect(lambda _i, n=col["name"], e=ed: self._commit_custom(n, e.currentText()))
             else:
                 ed = W.QLineEdit(placeholderText="number" if col["type"] == "number" else "")
-                ed.editingFinished.connect(lambda n=col["name"], e=ed: self._prop(lambda m: m.set_custom(n, e.text())))
+                ed.editingFinished.connect(lambda n=col["name"], e=ed: self._commit_custom(n, e.text()))
             ed.setEnabled(False)
             self.p_custom_form.addRow(col["name"], ed)
             self.p_custom_editors[col["name"]] = (col, ed)
+
+    def _commit_custom(self, name, text):
+        """Save a custom value, but only if it changed. (editingFinished also fires when the field just loses focus.)"""
+        m = self._selected()
+        if m is None or text.strip() == custom_text(m.custom().get(name)):
+            return
+        self._prop(lambda mk: mk.set_custom(name, text))
 
     def _header_menu(self, pos):
         if not self._need_doc():
