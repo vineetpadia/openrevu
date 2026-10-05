@@ -9,7 +9,7 @@ from .pages import compare_pdfs
 
 
 def _doc(a):
-    return Document(a.input, getattr(a, "password", None))
+    return Document(a.input, a.in_password)
 
 
 def main(argv=None) -> int:
@@ -19,6 +19,7 @@ def main(argv=None) -> int:
     def add(name, help_, *args):
         sp = sub.add_parser(name, help=help_)
         sp.add_argument("input")
+        sp.add_argument("--in-password", default=None, help="password of the input PDF, if encrypted")
         for a in args:
             sp.add_argument(*a[0], **a[1])
         return sp
@@ -40,6 +41,8 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     try:
         if a.cmd == "compare":
+            if a.in_password:
+                raise ValueError("compare does not support encrypted inputs")
             for i, f in enumerate(compare_pdfs(a.input, a.new, a.output)):
                 print(f"page {i + 1}: {f:.2%} changed")
             return 0

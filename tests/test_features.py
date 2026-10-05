@@ -4,9 +4,14 @@ import os
 import fitz
 import pytest
 
-from openrevu.core import STATUSES, Document, Scale, angle_deg
+from openrevu.core import STATUSES, Document, Scale, angle_deg, format_value
 from openrevu.pages import compare_pdfs
 from openrevu.toolchest import ToolChest
+
+
+def flat(pts):
+    """Flatten a list of points so pytest.approx can compare it."""
+    return [c for p in pts for c in p]
 
 
 def make_pdf(path, pages=3, text=True):
@@ -48,7 +53,7 @@ def test_edit_properties_status_and_replies(pdf):
     assert "" in STATUSES
 
 
-def test_move_resize_all_geometry_types(pdf):
+def test_move_resize_all_geometry_types(pdf):  # noqa: C901
     d = Document(pdf)
     d.add_rect(0, fitz.Rect(50, 50, 150, 100))
     d.add_line(0, (10, 10), (60, 60))
@@ -71,14 +76,99 @@ def test_move_resize_all_geometry_types(pdf):
     assert nr.width == pytest.approx(40, abs=2.5) and nr.height == pytest.approx(20, abs=2.5)
 
 
-def test_move_on_rotated_page(pdf):
+@pytest.mark.parametrize("rot", [0, 90, 180, 270])
+@pytest.mark.parametrize("crop", [False, True])
+def test_geometry_is_visual_on_rotated_cropped_pages(pdf, rot, crop):
+    """Public coordinates are what you see: create, read back, move and resize all agree."""
     d = Document(pdf)
-    d.rotate_pages([0], 90)
-    a = d.add_line(0, (10, 10), (60, 40))
+    if crop:
+        d.doc[0].set_cropbox(fitz.Rect(100, 100, 500, 500))
+    d.doc[0].set_rotation(rot)
+    vis = d.doc[0].rect
+    pts = [(50, 50), (150, 50), (150, 120)]
+    d.add_polyline(0, pts)
+    d.add_line(0, (20, 30), (90, 60))
+    d.add_freehand(0, [(10, 10), (40, 70)])
+    d.add_rect(0, fitz.Rect(200, 60, 260, 110))
+    got = {m.kind: m for m in d.markups()}
+    assert got["PolyLine"].points() == pytest.approx(pts, abs=0.5)
+    assert tuple(got["Square"].rect) == pytest.approx((200, 60, 260, 110), abs=1.5)
+    assert vis.contains(got["Square"].rect)
+    for m in list(d.markups()):
+        m.move(10, 20)
+    got = {m.kind: m for m in d.markups()}
+    assert flat(got["PolyLine"].points()) == pytest.approx(flat([(60, 70), (160, 70), (160, 140)]), abs=0.5)
+    assert flat(got["Line"].points()) == pytest.approx(flat([(30, 50), (100, 80)]), abs=0.5)
+    assert flat(got["Ink"].points()[0]) == pytest.approx(flat([(20, 30), (50, 90)]), abs=0.5)
+    assert tuple(got["Square"].rect) == pytest.approx((210, 80, 270, 130), abs=1.5)
+    got["Square"].resize(fitz.Rect(210, 80, 310, 140))
+    assert tuple([m for m in d.markups() if m.kind == "Square"][0].rect) == pytest.approx((210, 80, 310, 140), abs=2)
+    got["PolyLine"].resize(fitz.Rect(60, 70, 260, 140))
+    assert flat([m for m in d.markups() if m.kind == "PolyLine"][0].points()) == pytest.approx(flat([(60, 70), (260, 70), (260, 140)]), abs=2)
+
+
+@pytest.mark.parametrize("rot", [0, 90, 270])
+def test_measurement_label_follows_on_rotated_page(pdf, rot):
+    d = Document(pdf)
+    d.doc[0].set_rotation(rot)
+    d.add_length(0, [(50, 50), (150, 50)])
     m = d.markups()[0]
-    m.move(30, 5)
-    v = d.markups()[0].annot.vertices
-    assert v[0] == pytest.approx((40, 15), abs=1) and v[1] == pytest.approx((90, 45), abs=1)
+    lab = lambda: [x for x in d.markups(include_children=True) if x.subject == "Label"][0].rect  # noqa: E731
+    c0 = lab()
+    m.move(30, 10)
+    c1 = lab()
+    assert (c1.x0 - c0.x0, c1.y0 - c0.y0) == pytest.approx((30, 10), abs=1.5)
+    assert d.markups()[0].measurement()[1] == pytest.approx(100 * d.scale.unit_per_pt)
+
+
+def test_tools_on_rotated_page_land_where_drawn(pdf):
+    d = Document(pdf)
+    d.doc[0].set_rotation(90)
+    r = fitz.Rect(100, 150, 220, 200)
+    d.add_cloud(0, r); d.add_stamp(0, fitz.Rect(300, 300, 400, 340), "OK")
+    d.add_count(0, (50, 400)); d.add_text(0, fitz.Rect(300, 500, 400, 530), "t")
+    d.add_note(0, (60, 60), "n")
+    rects = {m.subject: m.rect for m in d.markups()}
+    assert rects["Cloud"].intersects(r) and abs(rects["Cloud"].x0 - 100) < 15
+    assert fitz.Rect(299, 299, 401, 341).contains(rects["Stamp"]) and rects["Stamp"].width > 90  # aspect-fitted, upright
+    assert rects["Count"].contains(fitz.Point(50, 400))
+    assert abs(rects["Text"].x0 - 300) < 2 and abs(rects["Text"].y0 - 500) < 2
+    assert d.markup_at(0, (50, 400)).subject == "Count"
+    hit = d.search("Plan")[0][1]
+    h = d.add_highlight(0, hit)
+    assert fitz.Rect(hit).contains(h.rect) or h.rect.intersects(d._ru(0, hit))
+
+
+def test_page_ops_on_rotated_pages(pdf, tmp_path):
+    d = Document(pdf)
+    d.doc[0].set_rotation(90)
+    d.crop_page(0, fitz.Rect(0, 0, 300, 100))
+    assert (d.doc[0].rect.width, d.doc[0].rect.height) == pytest.approx((300, 100))
+    d.crop_page(0, fitz.Rect(10, 10, 110, 60))  # relative to the visible area
+    assert (d.doc[0].rect.width, d.doc[0].rect.height) == pytest.approx((100, 50))
+    d.insert_blank(at=1); d.doc[1].set_rotation(270)
+    d.header_footer(footer=("", "FOOT {page}", ""))
+    d.bates("B-")
+    d.watermark("WM", pages=[1])
+    for p in (0, 1):
+        assert "FOOT" in d.page_text(p) and "B-000001" in d.page_text(0)
+    # text must read upright: its direction in visual space is (1, 0)
+    for p in (0, 1):
+        for b in d.doc[p].get_text("dict")["blocks"]:
+            for ln in b.get("lines", []):
+                if "FOOT" in "".join(s["text"] for s in ln["spans"]):
+                    dx, dy = ln["dir"]
+                    v = fitz.Point(dx, dy) * d.doc[p].rotation_matrix - fitz.Point(0, 0) * d.doc[p].rotation_matrix
+                    assert (round(v.x), round(v.y)) == (1, 0), (p, ln["dir"])
+
+
+def test_search_hits_are_visual_and_redaction_on_rotated_page(pdf, tmp_path):
+    d = Document(pdf)
+    d.doc[0].set_rotation(90)
+    hit = d.search("SECRET", pages=[0])[0][1]
+    assert d.doc[0].rect.contains(hit)
+    d.mark_redaction_text("SECRET"); d.apply_redactions()
+    assert "SECRET" not in d.page_text(0)
 
 
 def test_measurement_label_moves_and_deletes_with_parent(pdf):
@@ -466,3 +556,101 @@ def test_cli(pdf, tmp_path):
     assert main(["watermark", o("missing.pdf"), o("z.pdf"), "--text", "X"]) == 1
     from openrevu.core import Document as D
     assert main(["ocr", pdf, o("ocr.pdf")]) == (0 if D.ocr_available() else 1)
+
+
+def test_stale_markup_raises_instead_of_crashing(pdf):
+    d = Document(pdf)
+    d.add_rect(0, fitz.Rect(10, 10, 50, 50))
+    m = d.markups()[0]
+    d.undo()
+    with pytest.raises(RuntimeError, match="stale"):
+        m.rect
+    d.add_rect(0, fitz.Rect(10, 10, 50, 50))
+    m = d.markups()[0]
+    d.save()
+    with pytest.raises(RuntimeError, match="stale"):
+        m.subject
+
+
+def test_format_value():
+    assert format_value("area", 12.5, "ft") == "12.50 ft²"
+    assert format_value("volume", 3, "m") == "3.00 m³"
+    assert format_value("length", 3, "m") == "3.00 m"
+    assert format_value("angle", 90, "deg") == "90.0°"
+    assert format_value("count", 4, "ea") == "4 ea"
+
+
+# ---------- regressions from independent review ----------
+def test_save_in_place_keeps_encryption(pdf, tmp_path):
+    out = str(tmp_path / "enc.pdf")
+    Document(pdf).save_encrypted(out, "pw")
+    d = Document(out, "pw")
+    d.add_rect(0, fitz.Rect(10, 10, 50, 50))
+    d.save()
+    assert fitz.open(out).needs_pass
+    assert len(Document(out, "pw").markups()) == 1
+    d.add_rect(0, fitz.Rect(60, 60, 90, 90)); d.save(str(tmp_path / "copy.pdf"))
+    assert fitz.open(str(tmp_path / "copy.pdf")).needs_pass
+
+
+def test_apply_to_all_pages_scale_is_undoable(pdf):
+    d = Document(pdf)
+    d.set_scale(Scale("m", 0.3), page=0)
+    d.set_scale(Scale("ft", 0.5), reset_pages=True)
+    assert d.page_scales == {}
+    d.undo()
+    assert d.page_scales[0].unit_per_pt == 0.3
+
+
+def test_flatten_keeps_scales(pdf):
+    d = Document(pdf)
+    d.set_scale(Scale("m", 0.3), page=1)
+    d.flatten()
+    assert d.scale_for(1).unit_per_pt == 0.3
+
+
+def test_redaction_removes_annotation_text(pdf):
+    d = Document(pdf)
+    d.add_note(0, (200, 200), "SECRET note")
+    d.add_note(1, (300, 300), "harmless")
+    assert d.mark_redaction_text("SECRET") == 4  # 3 text hits + the note
+    d.apply_redactions()
+    comments = [m.comment for m in d.markups()]
+    assert "SECRET note" not in comments and "harmless" in comments
+    assert not any("SECRET" in d.page_text(i) for i in range(3))
+
+
+def test_covered_annotation_is_removed_by_redaction(pdf):
+    d = Document(pdf)
+    d.add_note(0, (200, 200), "private")
+    d.mark_redaction(0, fitz.Rect(190, 190, 230, 230))
+    d.apply_redactions()
+    assert [m for m in d.markups() if m.comment == "private"] == []
+
+
+def test_cli_encrypted_input(pdf, tmp_path):
+    from openrevu.cli import main
+    enc = str(tmp_path / "enc.pdf")
+    assert main(["encrypt", pdf, enc, "--password", "pw"]) == 0
+    assert main(["watermark", enc, str(tmp_path / "o.pdf"), "--text", "X"]) == 1
+    assert main(["watermark", enc, str(tmp_path / "o.pdf"), "--text", "X", "--in-password", "pw"]) == 0
+    assert main(["encrypt", enc, str(tmp_path / "re.pdf"), "--password", "new", "--in-password", "pw"]) == 0
+    assert Document(str(tmp_path / "re.pdf"), "new").page_count == 3
+
+
+@pytest.mark.parametrize("rot", [0, 90, 180, 270])
+def test_watermark_image_orientation(pdf, tmp_path, rot):
+    # left half black, right half white: after rendering the black half must still be on the left
+    pm = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 20), False)
+    pm.set_rect(pm.irect, (255, 255, 255)); pm.set_rect(fitz.IRect(0, 0, 20, 20), (0, 0, 0))
+    img = tmp_path / "lr.png"; pm.save(str(img))
+    d = Document(pdf)
+    d.doc[0].set_rotation(rot)
+    d.watermark_image(str(img), pages=[0], scale=0.6)
+    pix = d.render(0, 1.0)
+    w, h = pix.width, pix.height
+    cy = h // 2
+    dark = [x for x in range(w) if pix.pixel(x, cy)[0] < 60]
+    assert dark, "image not drawn"
+    cx = (min(dark) + max(dark)) / 2
+    assert cx < w / 2 - 5, f"black half should be left of centre, got {cx} of {w}"

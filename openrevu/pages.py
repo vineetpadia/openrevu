@@ -15,6 +15,7 @@ class PageOps:
     def _remap_scales(self, mapping: dict):
         """mapping: old page index -> new index (missing = page removed)."""
         self.page_scales = {mapping[k]: v for k, v in self.page_scales.items() if k in mapping}
+        self._invalidate_pages()
 
     def _check(self, pnos):
         for p in pnos:
@@ -67,12 +68,14 @@ class PageOps:
 
     @mutates
     def crop_page(self, pno, rect):
+        """Crop to rect given in visual page coordinates (relative to the currently visible area)."""
         self._check([pno])
-        pg = self.doc[pno]
-        r = fitz.Rect(rect) & pg.rect
-        if r.is_empty:
+        pg = self._page(pno)
+        r = self._ru(pno, fitz.Rect(rect) & pg.rect)
+        if r.is_empty or r.width < 1 or r.height < 1:
             raise ValueError("crop rectangle outside page")
-        pg.set_cropbox(r)
+        cb = pg.cropbox
+        pg.set_cropbox(fitz.Rect(r.x0 + cb.x0, r.y0 + cb.y0, r.x1 + cb.x0, r.y1 + cb.y0))
 
     @mutates
     def insert_pdf(self, path, at=None, pages=None, password=None):
@@ -148,15 +151,16 @@ class PageOps:
 
     @mutates
     def add_link_uri(self, pno, rect, uri):
-        self.doc[pno].insert_link({"kind": fitz.LINK_URI, "from": fitz.Rect(rect), "uri": uri})
+        self._page(pno).insert_link({"kind": fitz.LINK_URI, "from": self._ru(pno, rect), "uri": uri})
 
     @mutates
     def add_link_goto(self, pno, rect, target_page):
         self._check([target_page])
-        self.doc[pno].insert_link({"kind": fitz.LINK_GOTO, "from": fitz.Rect(rect), "page": target_page})
+        self._page(pno).insert_link({"kind": fitz.LINK_GOTO, "from": self._ru(pno, rect), "page": target_page})
 
     def links(self, pno):
-        return self.doc[pno].get_links()
+        # PyMuPDF's in-memory link list lags behind insert_link on a modified page; a serialized copy is exact.
+        return fitz.open("pdf", self.doc.tobytes())[pno].get_links()
 
     @mutates
     def set_page_labels(self, rules):
@@ -164,17 +168,17 @@ class PageOps:
         self.doc.set_page_labels(rules)
 
     def page_label(self, pno):
-        return self.doc[pno].get_label()
+        return self._page(pno).get_label()
 
     # ---- text: search / OCR ----
     def search(self, text, pages=None):
         out = []
         for p in (range(len(self.doc)) if pages is None else pages):
-            out += [(p, r) for r in self.doc[p].search_for(text)]
+            out += [(p, self._rv(p, r)) for r in self.doc[p].search_for(text)]
         return out
 
     def page_text(self, pno):
-        return self.doc[pno].get_text()
+        return self._page(pno).get_text()
 
     @staticmethod
     def ocr_available() -> bool:
@@ -201,13 +205,13 @@ class PageOps:
     def watermark(self, text, pages=None, color=(0.7, 0.7, 0.7), opacity=0.3, fontsize=64, angle=45):
         for p in (range(len(self.doc)) if pages is None else pages):
             pg = self.doc[p]
-            r = pg.rect
-            c = fitz.Point(r.width / 2, r.height / 2)
-            tw = fitz.TextWriter(r, opacity=opacity, color=color)
+            vr = pg.rect
+            c = self._tu(p, (vr.width / 2, vr.height / 2))  # centre in API (unrotated) space
+            tw = fitz.TextWriter(pg.mediabox, opacity=opacity, color=color)
             font = fitz.Font("helv")
             w = font.text_length(text, fontsize)
             tw.append((c.x - w / 2, c.y + fontsize / 3), text, font=font, fontsize=fontsize)
-            tw.write_text(pg, morph=(c, fitz.Matrix(-angle)), overlay=True)
+            tw.write_text(pg, morph=(c, fitz.Matrix(-(angle + pg.rotation))), overlay=True)
 
     @mutates
     def watermark_image(self, image_path, pages=None, opacity=0.3, scale=0.6):
@@ -215,8 +219,13 @@ class PageOps:
             pg = self.doc[p]
             w, h = pg.rect.width * scale, pg.rect.height * scale
             c = fitz.Point(pg.rect.width / 2, pg.rect.height / 2)
-            pg.insert_image(fitz.Rect(c.x - w / 2, c.y - h / 2, c.x + w / 2, c.y + h / 2),
-                            filename=image_path, overlay=True, keep_proportion=True, alpha=int(opacity * 255))
+            box = self._ru(p, fitz.Rect(c.x - w / 2, c.y - h / 2, c.x + w / 2, c.y + h / 2))
+            pg.insert_image(box, filename=image_path, overlay=True, keep_proportion=True, rotate=pg.rotation)
+
+    def _put_text(self, pno, x, y, text, fontsize, fontname="helv"):
+        """Insert upright text with its baseline start at visual point (x, y)."""
+        pg = self._page(pno)
+        pg.insert_text(self._tu(pno, (x, y)), text, fontsize=fontsize, fontname=fontname, rotate=pg.rotation)
 
     @mutates
     def header_footer(self, header=("", "", ""), footer=("", "", ""), fontsize=9, margin=24, pages=None, name=""):
@@ -224,8 +233,7 @@ class PageOps:
         n, today = len(self.doc), datetime.date.today().isoformat()
         font = fitz.Font("helv")
         for p in (range(n) if pages is None else pages):
-            pg = self.doc[p]
-            r = pg.rect
+            r = self.doc[p].rect
 
             def put(texts, y):
                 for t, align in zip(texts, (0, 1, 2)):
@@ -234,7 +242,7 @@ class PageOps:
                         continue
                     w = font.text_length(t, fontsize)
                     x = (margin, (r.width - w) / 2, r.width - margin - w)[align]
-                    pg.insert_text((x, y), t, fontsize=fontsize, fontname="helv")
+                    self._put_text(p, x, y, t, fontsize)
 
             put(header, margin)
             put(footer, r.height - margin + fontsize)
@@ -243,41 +251,56 @@ class PageOps:
     def bates(self, prefix="", start=1, digits=6, pages=None, position="br"):
         n = len(self.doc)
         for i, p in enumerate(range(n) if pages is None else pages):
-            pg = self.doc[p]
+            r = self.doc[p].rect
             t = f"{prefix}{start + i:0{digits}d}"
             w = fitz.Font("helv").text_length(t, 10)
-            x = pg.rect.width - 24 - w if "r" in position else 24
-            y = pg.rect.height - 18 if "b" in position else 28
-            pg.insert_text((x, y), t, fontsize=10)
+            x = r.width - 24 - w if "r" in position else 24
+            y = r.height - 18 if "b" in position else 28
+            self._put_text(p, x, y, t, 10)
 
     # ---- redaction / flatten / security ----
     @mutates
     def mark_redaction(self, pno, rect, fill=(0, 0, 0)):
-        self.doc[pno].add_redact_annot(rect, fill=fill)
+        self._page(pno).add_redact_annot(self._ru(pno, rect), fill=fill)
 
     @mutates
     def mark_redaction_text(self, text, fill=(0, 0, 0)):
+        """Mark page text matches, and any annotation whose comment/subject contains the text."""
         n = 0
         for p, r in self.search(text):
-            self.doc[p].add_redact_annot(r, fill=fill)
+            self.doc[p].add_redact_annot(self._ru(p, r), fill=fill)
             n += 1
+        needle = text.lower()
+        for pg in self.doc:
+            hits = [a.rect for a in pg.annots() or []
+                    if a.type[1] != "Redact" and needle in (a.info.get("content", "") + a.info.get("subject", "")).lower()]
+            for r in hits:
+                pg.add_redact_annot(r, fill=fill)
+                n += 1
         return n
 
     @mutates
     def apply_redactions(self):
-        """Permanently remove content under marked areas (text, images, vector art)."""
+        """Permanently remove content under marked areas: page text, images, line art, and any annotation
+        (notes, comments, stamps...) overlapping a mark."""
         n = 0
         for pg in self.doc:
             marks = [a for a in pg.annots() or [] if a.type[1] == "Redact"]
-            if marks:
-                pg.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
-                n += len(marks)
+            if not marks:
+                continue
+            areas = [m.rect for m in marks]
+            for a in list(pg.annots() or []):
+                if a.type[1] != "Redact" and any(a.rect.intersects(r) for r in areas):
+                    pg.delete_annot(a)
+            pg.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
+            n += len(marks)
+        self._invalidate_pages()
         return n
 
     @mutates
     def flatten(self, annots=True, widgets=True):
         self.doc.bake(annots=annots, widgets=widgets)
-        self.page_scales = {}
+        self._invalidate_pages()
 
     def save_encrypted(self, path, user_pw, owner_pw=None, allow_print=True, allow_copy=False, allow_modify=False):
         perm = fitz.PDF_PERM_ACCESSIBILITY
@@ -335,12 +358,12 @@ class PageOps:
 
     # ---- images / thumbnails ----
     def thumbnail(self, pno, width=120):
-        pg = self.doc[pno]
+        pg = self._page(pno)
         z = width / pg.rect.width
         return pg.get_pixmap(matrix=fitz.Matrix(z, z), annots=True)
 
     def export_png(self, pno, path, dpi=150, clip=None):
-        self.doc[pno].get_pixmap(dpi=dpi, annots=True, clip=clip).save(path)
+        self._page(pno).get_pixmap(dpi=dpi, annots=True, clip=clip).save(path)
         return path
 
     # ---- signatures (visual) ----
@@ -352,7 +375,8 @@ class PageOps:
         sp.insert_textbox(fitz.Rect(5, 5, 295, 50), name, fontsize=30, fontname="heit", color=(0, 0, 0.6))
         sp.insert_textbox(fitz.Rect(5, 55, 295, 88), f"Digitally placed {datetime.date.today().isoformat()}",
                           fontsize=11, color=(0.3, 0.3, 0.3))
-        a = self.doc[pno].add_stamp_annot(rect, stamp=sp.get_pixmap(dpi=144))
+        sp.set_rotation((360 - self._page(pno).rotation) % 360)
+        a = self._page(pno).add_stamp_annot(self._ru(pno, rect), stamp=sp.get_pixmap(dpi=144))
         a.set_info(title=self.author, subject="Signature", content=name)
         a.update()
         return a

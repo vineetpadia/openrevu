@@ -103,9 +103,14 @@ def cloud_points(rect: fitz.Rect, arc: float = 14.0, steps: int = 6):
     return pts
 
 
-def _pdf_pts(page, pts) -> str:
-    inv = ~page.transformation_matrix
-    return " ".join(f"{q.x:g} {q.y:g}" for q in (fitz.Point(p) * inv for p in pts))
+def format_value(kind: str, val: float, unit: str) -> str:
+    """Human-readable measurement, e.g. 'area' 12.5 'ft' -> '12.50 ft²'."""
+    suffix = {"area": "²", "volume": "³"}.get(kind, "")
+    if kind == "angle":
+        return f"{val:.1f}°"
+    if kind == "count":
+        return f"{val:g} ea"
+    return f"{val:.2f} {unit}{suffix}"
 
 
 def _xget(doc, xref, key):
@@ -117,11 +122,19 @@ class Markup:
     """A PDF annotation plus OpenRevu metadata (measurement, status, replies)."""
 
     def __init__(self, annot: fitz.Annot, page_no: int, page: fitz.Page, d: "Document"):
-        self.annot, self.page_no, self._page, self.d = annot, page_no, page, d  # keep page alive
+        self._annot, self.page_no, self._page, self.d = annot, page_no, page, d  # keep page alive
+        self._gen = d.generation
+        self._xref = annot.xref
+
+    @property
+    def annot(self) -> fitz.Annot:
+        if self._gen != self.d.generation:  # underlying document was reopened (undo/redo): avoid a native crash
+            raise RuntimeError("stale markup: re-fetch it from Document.markups()")
+        return self._annot
 
     @property
     def xref(self) -> int:
-        return self.annot.xref
+        return self._xref
 
     @property
     def kind(self) -> str:
@@ -145,7 +158,8 @@ class Markup:
 
     @property
     def rect(self) -> fitz.Rect:
-        return self.annot.rect
+        """Bounding box in visual page coordinates."""
+        return self.d._rv(self.page_no, self.annot.rect)
 
     @property
     def status(self) -> str:
@@ -215,63 +229,82 @@ class Markup:
                 if _xget(self.d.doc, a.xref, PARENT_KEY) == str(self.xref)]
 
     def points(self):
-        """Geometry as flat list of (x, y); for Ink, list of strokes."""
-        return self.annot.vertices
+        """Geometry in visual coordinates: list of points; for Ink, list of strokes."""
+        v, pn = self.annot.vertices, self.page_no
+        if self.kind == "Ink":
+            return [[tuple(self.d._tv(pn, p)) for p in st] for st in v]
+        return [tuple(self.d._tv(pn, p)) for p in v or []]
 
-    def transform(self, dx=0.0, dy=0.0, sx=1.0, sy=1.0):
-        """Scale about the bbox top-left by (sx, sy), then translate by (dx, dy)."""
+    def _check_transformable(self):
+        if self.kind not in VERTEX_TYPES and self.kind not in RECT_TYPES:
+            raise ValueError(f"cannot move or resize {self.kind} markups")
+
+    def move(self, dx, dy):
+        """Move by (dx, dy) in visual coordinates."""
+        self._check_transformable()
+        new = self.rect + (dx, dy, dx, dy)
         self._edit()
-        self._transform(dx, dy, sx, sy)
+        self._apply(self.d._ru(self.page_no, new))
 
-    def _transform(self, dx, dy, sx, sy):
-        a, page = self.annot, self._page
-        r = a.rect
-        ox, oy = r.x0, r.y0
+    def resize(self, new_rect):
+        """Resize to new_rect (visual coordinates)."""
+        self._check_transformable()
+        if self.measurement():
+            raise ValueError("resizing would invalidate the measurement")
+        old = self.annot.rect
+        if old.width == 0 or old.height == 0:
+            raise ValueError("degenerate markup")
+        self._edit()
+        self._apply(self.d._ru(self.page_no, new_rect))
 
-        def f(p):
-            return (ox + (p[0] - ox) * sx + dx, oy + (p[1] - oy) * sy + dy)
-
+    def _apply(self, new_u: fitz.Rect, children=True):
+        """Map the annotation's current (API-space) bbox onto new_u, scaling vertices accordingly."""
+        a, page, doc = self.annot, self._page, self.d.doc
+        old, outer_old = a.rect, a.rect
+        if self.kind in VERTEX_TYPES:
+            # a.rect is the vertex bbox plus stroke padding: scale the vertices' own bbox, keep the padding
+            pts = [p for st in a.vertices for p in st] if self.kind == "Ink" else a.vertices
+            vb = fitz.Rect(min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts))
+            pad = (vb.x0 - old.x0, vb.y0 - old.y0, old.x1 - vb.x1, old.y1 - vb.y1)
+            new_vb = fitz.Rect(new_u.x0 + pad[0], new_u.y0 + pad[1], new_u.x1 - pad[2], new_u.y1 - pad[3])
+            old, new_u = vb, new_vb
+        sx = new_u.width / old.width if old.width else 1.0
+        sy = new_u.height / old.height if old.height else 1.0
+        f = lambda p: (new_u.x0 + (p[0] - old.x0) * sx, new_u.y0 + (p[1] - old.y0) * sy)  # noqa: E731
+        raw = lambda pts: " ".join(f"{x + page.cropbox.x0:g} {page.mediabox.height - (y + page.cropbox.y0):g}"  # noqa: E731
+                                   for x, y in pts)
         if self.kind in VERTEX_TYPES:
             v = a.vertices
             if self.kind == "Ink":
-                s = "[" + "".join("[" + _pdf_pts(page, [f(p) for p in st]) + "]" for st in v) + "]"
-                self.d.doc.xref_set_key(self.xref, "InkList", s)
+                doc.xref_set_key(self.xref, "InkList", "[" + "".join("[" + raw([f(p) for p in st]) + "]" for st in v) + "]")
             elif self.kind == "Line":
-                self.d.doc.xref_set_key(self.xref, "L", "[" + _pdf_pts(page, [f(p) for p in v]) + "]")
+                doc.xref_set_key(self.xref, "L", "[" + raw([f(p) for p in v]) + "]")
             else:
-                self.d.doc.xref_set_key(self.xref, "Vertices", "[" + _pdf_pts(page, [f(p) for p in v]) + "]")
-        elif self.kind in RECT_TYPES:
-            nr = fitz.Rect(*f((r.x0, r.y0)), *f((r.x1, r.y1)))
-            a.set_rect(nr)
+                doc.xref_set_key(self.xref, "Vertices", "[" + raw([f(p) for p in v]) + "]")
         else:
-            raise ValueError(f"cannot transform {self.kind} markups")
+            if self.kind in ("Square", "Circle"):  # annot.rect includes the /RD border padding; set_rect wants the inner rect
+                rd = _xget(doc, self.xref, "RD")
+                l, t, r_, b_ = [float(v) for v in rd.strip("[]").split()] if rd else (0, 0, 0, 0)
+                new_u = fitz.Rect(new_u.x0 + l, new_u.y0 + t, new_u.x1 - r_, new_u.y1 - b_)
+            a.set_rect(new_u)
         a.update()
-        if (sx, sy) == (1.0, 1.0):
+        if children and (sx, sy) == (1.0, 1.0):
+            dxu, dyu = new_u.x0 - old.x0, new_u.y0 - old.y0  # translation is identical for padded and inner boxes
             for c in self._children():
-                Markup(c, self.page_no, page, self.d)._transform(dx, dy, 1.0, 1.0)
-
-    def move(self, dx, dy):
-        self.transform(dx, dy)
-
-    def resize(self, new_rect):
-        if self.measurement():
-            raise ValueError("resizing would invalidate the measurement")
-        r = self.annot.rect
-        if r.width == 0 or r.height == 0:
-            raise ValueError("degenerate markup")
-        new_rect = fitz.Rect(new_rect).normalize()
-        self.transform(new_rect.x0 - r.x0, new_rect.y0 - r.y0, new_rect.width / r.width, new_rect.height / r.height)
+                m = Markup(c, self.page_no, page, self.d)
+                m._apply(fitz.Rect(c.rect.x0 + dxu, c.rect.y0 + dyu, c.rect.x1 + dxu, c.rect.y1 + dyu), children=False)
 
     def to_dict(self):
         """Serialisable description (for tool chest / copy-paste)."""
         a = self.annot
         c = a.colors
+        pts = self.points()
         return {
             "kind": self.kind, "subject": self.subject, "comment": self.comment,
             "stroke": c.get("stroke"), "fill": c.get("fill"), "width": a.border.get("width", 1),
-            "opacity": a.opacity, "rect": list(a.rect),
-            "vertices": [[list(p) for p in s] for s in a.vertices] if self.kind == "Ink"
-            else ([list(p) for p in a.vertices] if a.vertices else None),
+            "opacity": a.opacity, "rect": list(self.rect),
+            "vertices": [[list(p) for p in st] for st in pts] if self.kind == "Ink"
+            else ([list(p) for p in pts] if pts else None),
             "arrow": bool(a.line_ends and a.line_ends[1] == fitz.PDF_ANNOT_LE_CLOSED_ARROW)
             if self.kind == "Line" else False,
         }
@@ -281,15 +314,49 @@ class Document(PageOps):
 
     def __init__(self, path: str | None = None, password: str | None = None):
         self.doc = fitz.open(path) if path else fitz.open()
-        if self.doc.needs_pass and not (password and self.doc.authenticate(password)):
+        encrypted = bool(self.doc.needs_pass)
+        if encrypted and not (password and self.doc.authenticate(password)):
             raise PermissionError("password required or incorrect")
         self.path = path
+        self._password = password if encrypted else None  # re-applied on save so protection is never silently dropped
         self.author = getpass.getuser()
         self._depth = 0
+        self.generation = 0
+        self._pcache: dict[int, fitz.Page] = {}
         self._undo: list[bytes] = []
         self._redo: list[bytes] = []
         self.modified = False
         self.default_scale, self.page_scales = self._load_scales()
+
+    def _page(self, pno: int) -> fitz.Page:
+        """Page object kept alive (annotations returned by add_* are only valid while their page is)."""
+        pg = self._pcache.get(pno)
+        if pg is None:
+            pg = self._pcache[pno] = self.doc[pno]
+        return pg
+
+    def _invalidate_pages(self):
+        """Call after anything that renumbers/replaces pages or reopens the document."""
+        self._pcache = {}
+        self.generation += 1
+
+    # --- coordinate spaces ---
+    # PyMuPDF annotation/text APIs use unrotated, cropbox-origin, y-down coordinates; the UI and the public
+    # OpenRevu API use *visual* coordinates (what is drawn). These convert at the boundary.
+    def _tu(self, pno, p):
+        return fitz.Point(p) * self._page(pno).derotation_matrix
+
+    def _tv(self, pno, p):
+        return fitz.Point(p) * self._page(pno).rotation_matrix
+
+    def _tus(self, pno, pts):
+        return [tuple(self._tu(pno, p)) for p in pts]
+
+    def _ru(self, pno, r):
+        return fitz.Rect(r).normalize() * self._page(pno).derotation_matrix
+
+    def _rv(self, pno, r):
+        return fitz.Rect(r) * self._page(pno).rotation_matrix
 
     # --- undo / redo ---
     MAX_UNDO = 30
@@ -302,6 +369,7 @@ class Document(PageOps):
         self.modified = True
 
     def _reopen(self, data: bytes):
+        self._invalidate_pages()
         self.doc.close()
         self.doc = fitz.open("pdf", data)
         self.default_scale, self.page_scales = self._load_scales()
@@ -353,9 +421,12 @@ class Document(PageOps):
     def scale_for(self, pno: int) -> Scale:
         return self.page_scales.get(pno, self.default_scale)
 
-    def set_scale(self, scale: Scale, page: int | None = None, pages=None):
-        """Set the default scale, or the scale of one page / a list of pages."""
+    def set_scale(self, scale: Scale, page: int | None = None, pages=None, reset_pages: bool = False):
+        """Set the default scale, or the scale of one page / a list of pages.
+        reset_pages=True also clears every per-page override (apply to all pages)."""
         self.checkpoint()
+        if reset_pages:
+            self.page_scales = {}
         if pages is not None or page is not None:
             for p in ([page] if pages is None else pages):
                 self.page_scales[p] = scale
@@ -379,39 +450,39 @@ class Document(PageOps):
 
     @_mutates
     def add_rect(self, pno, rect, color=(1, 0, 0), width=1.5, fill=None, opacity=1.0):
-        return self._finish(self.doc[pno].add_rect_annot(rect), color, width, "Rectangle", fill=fill, opacity=opacity)
+        return self._finish(self._page(pno).add_rect_annot(self._ru(pno, rect)), color, width, "Rectangle", fill=fill, opacity=opacity)
 
     @_mutates
     def add_ellipse(self, pno, rect, color=(1, 0, 0), width=1.5, fill=None, opacity=1.0):
-        return self._finish(self.doc[pno].add_circle_annot(rect), color, width, "Ellipse", fill=fill, opacity=opacity)
+        return self._finish(self._page(pno).add_circle_annot(self._ru(pno, rect)), color, width, "Ellipse", fill=fill, opacity=opacity)
 
     @_mutates
     def add_line(self, pno, p1, p2, color=(1, 0, 0), width=1.5, arrow=False):
-        a = self.doc[pno].add_line_annot(p1, p2)
+        a = self._page(pno).add_line_annot(self._tu(pno, p1), self._tu(pno, p2))
         if arrow:
             a.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_CLOSED_ARROW)
         return self._finish(a, color, width, "Arrow" if arrow else "Line")
 
     @_mutates
     def add_polyline(self, pno, pts, color=(1, 0, 0), width=1.5):
-        return self._finish(self.doc[pno].add_polyline_annot(pts), color, width, "Polyline")
+        return self._finish(self._page(pno).add_polyline_annot(self._tus(pno, pts)), color, width, "Polyline")
 
     @_mutates
     def add_polygon(self, pno, pts, color=(1, 0, 0), width=1.5, fill=None, opacity=1.0):
-        return self._finish(self.doc[pno].add_polygon_annot(pts), color, width, "Polygon", fill=fill, opacity=opacity)
+        return self._finish(self._page(pno).add_polygon_annot(self._tus(pno, pts)), color, width, "Polygon", fill=fill, opacity=opacity)
 
     @_mutates
     def add_freehand(self, pno, pts, color=(1, 0, 0), width=2):
-        return self._finish(self.doc[pno].add_ink_annot([list(pts)]), color, width, "Pen")
+        return self._finish(self._page(pno).add_ink_annot([self._tus(pno, pts)]), color, width, "Pen")
 
     @_mutates
     def add_cloud(self, pno, rect, color=(1, 0, 0), width=1.5):
-        return self._finish(self.doc[pno].add_polyline_annot(cloud_points(rect)), color, width, "Cloud")
+        return self._finish(self._page(pno).add_polyline_annot(self._tus(pno, cloud_points(rect))), color, width, "Cloud")
 
     def _markup_text(self, pno, rect, kind, color):
-        page = self.doc[pno]
-        words = [w for w in page.get_text("words") if fitz.Rect(w[:4]).intersects(rect)]
-        quads = [fitz.Rect(w[:4]).quad for w in words] or [fitz.Rect(rect).quad]
+        page, ru = self._page(pno), self._ru(pno, rect)
+        words = [w for w in page.get_text("words") if fitz.Rect(w[:4]).intersects(ru)]
+        quads = [fitz.Rect(w[:4]).quad for w in words] or [ru.quad]
         a = getattr(page, f"add_{kind}_annot")(quads=quads)
         a.set_colors(stroke=color)
         a.set_info(title=self.author, subject=kind.title())
@@ -436,7 +507,7 @@ class Document(PageOps):
 
     @_mutates
     def add_text(self, pno, rect, text, color=(1, 0, 0), fontsize=12, fill=(1, 1, 1)):
-        a = self.doc[pno].add_freetext_annot(rect, text, fontsize=fontsize, text_color=color, fill_color=fill)
+        a = self._page(pno).add_freetext_annot(self._ru(pno, rect), text, fontsize=fontsize, text_color=color, fill_color=fill)
         a.set_info(title=self.author, subject="Text")
         a.update()
         return a
@@ -444,7 +515,7 @@ class Document(PageOps):
     @_mutates
     def add_callout(self, pno, rect, text, tip, color=(1, 0, 0), fontsize=11):
         """Text box with a leader line to `tip` (a callout)."""
-        a = self.doc[pno].add_freetext_annot(rect, text, fontsize=fontsize, text_color=color, fill_color=(1, 1, 1))
+        a = self._page(pno).add_freetext_annot(self._ru(pno, rect), text, fontsize=fontsize, text_color=color, fill_color=(1, 1, 1))
         a.set_info(title=self.author, subject="Callout")
         a.update()
         r = fitz.Rect(rect)
@@ -454,7 +525,7 @@ class Document(PageOps):
 
     @_mutates
     def add_note(self, pno, point, text):
-        a = self.doc[pno].add_text_annot(point, text)
+        a = self._page(pno).add_text_annot(self._tu(pno, point), text)
         a.set_info(title=self.author, subject="Note", content=text)
         a.update()
         return a
@@ -482,14 +553,15 @@ class Document(PageOps):
                           fontsize=38 if date else 40, fontname="hebo", color=color, align=1)
         if date:
             sp.insert_textbox(fitz.Rect(8, h * 0.66, w - 8, h - 4), lines[1], fontsize=18, color=color, align=1)
-        a = self.doc[pno].add_stamp_annot(r, stamp=sp.get_pixmap(dpi=144))
+        sp.set_rotation((360 - self._page(pno).rotation) % 360)  # pre-rotate so it displays upright on rotated pages
+        a = self._page(pno).add_stamp_annot(self._ru(pno, r), stamp=sp.get_pixmap(dpi=144))
         a.set_info(title=self.author, subject="Stamp", content=text)
         a.update()
         return a
 
     @_mutates
     def add_image_stamp(self, pno, rect, image_path, subject="Image"):
-        a = self.doc[pno].add_stamp_annot(rect, stamp=image_path)
+        a = self._page(pno).add_stamp_annot(self._ru(pno, rect), stamp=image_path)
         a.set_info(title=self.author, subject=subject)
         a.update()
         return a
@@ -498,11 +570,11 @@ class Document(PageOps):
     def add_from_dict(self, pno, d, offset=(0, 0)):
         """Recreate a markup from Markup.to_dict() at an offset (paste / tool chest)."""
         dx, dy = offset
-        k, page = d["kind"], self.doc[pno]
+        k, page = d["kind"], self._page(pno)
         col = tuple(d["stroke"]) if d.get("stroke") else None
         fill = tuple(d["fill"]) if d.get("fill") else None
-        r = fitz.Rect(d["rect"]) + (dx, dy, dx, dy)
-        sh = lambda pts: [(p[0] + dx, p[1] + dy) for p in pts]  # noqa: E731
+        r = self._ru(pno, fitz.Rect(d["rect"]) + (dx, dy, dx, dy))
+        sh = lambda pts: self._tus(pno, [(p[0] + dx, p[1] + dy) for p in pts])  # noqa: E731
         if k == "Square":
             a = page.add_rect_annot(r)
         elif k == "Circle":
@@ -516,7 +588,7 @@ class Document(PageOps):
         elif k == "Polygon":
             a = page.add_polygon_annot(sh(d["vertices"]))
         elif k == "Ink":
-            a = page.add_ink_annot([sh(s) for s in d["vertices"]])
+            a = page.add_ink_annot([sh(st) for st in d["vertices"]])
         elif k == "FreeText":
             a = page.add_freetext_annot(r, d["comment"], fontsize=12, text_color=col or (1, 0, 0), fill_color=fill or (1, 1, 1))
         elif k == "Text":
@@ -535,7 +607,7 @@ class Document(PageOps):
     def _label(self, pno, center, text, color, parent):
         w = 6.2 * len(text) + 8
         r = fitz.Rect(center[0] - w / 2, center[1] - 8, center[0] + w / 2, center[1] + 8)
-        a = self.doc[pno].add_freetext_annot(r, text, fontsize=10, text_color=color, fill_color=(1, 1, 1))
+        a = self._page(pno).add_freetext_annot(self._ru(pno, r), text, fontsize=10, text_color=color, fill_color=(1, 1, 1))
         a.set_info(title=self.author, subject="Label")
         a.update()
         self.doc.xref_set_key(a.xref, PARENT_KEY, str(parent.xref))
@@ -549,9 +621,10 @@ class Document(PageOps):
         pts = [tuple(p) for p in pts]
         sc = self.scale_for(pno)
         v = sc.length(pts)
-        pg = self.doc[pno]
-        a = pg.add_polyline_annot(pts) if len(pts) > 2 else pg.add_line_annot(*pts)
-        self._finish(a, color, 1.5, subject, measure=f"length:{v:.6f}:{sc.unit}")
+        pg = self._page(pno)
+        up = self._tus(pno, pts)
+        a = pg.add_polyline_annot(up) if len(pts) > 2 else pg.add_line_annot(*up)
+        self._finish(a, color, 1.5, subject, measure=f"length:{v:.10g}:{sc.unit}")
         if label:
             mid = pts[len(pts) // 2] if len(pts) > 2 else self._centroid(pts)
             self._label(pno, mid, f"{v:.2f} {sc.unit}", color, a)
@@ -562,8 +635,8 @@ class Document(PageOps):
         pts = [tuple(p) for p in pts]
         sc = self.scale_for(pno)
         v = sc.length(pts + pts[:1])
-        a = self.doc[pno].add_polygon_annot(pts)
-        self._finish(a, color, 1.5, subject, measure=f"perimeter:{v:.6f}:{sc.unit}")
+        a = self._page(pno).add_polygon_annot(self._tus(pno, pts))
+        self._finish(a, color, 1.5, subject, measure=f"perimeter:{v:.10g}:{sc.unit}")
         if label:
             self._label(pno, self._centroid(pts), f"{v:.2f} {sc.unit}", color, a)
         return a, v
@@ -581,10 +654,10 @@ class Document(PageOps):
             if depth <= 0:
                 raise ValueError("depth must be positive")
             v, kind, txt = v * depth, "volume", f"{v * depth:.2f} {sc.unit}³"
-        a = self.doc[pno].add_polygon_annot(pts)
-        self._finish(a, color, 1.5, subject, fill=color, opacity=0.25, measure=f"{kind}:{v:.6f}:{unit}")
+        a = self._page(pno).add_polygon_annot(self._tus(pno, pts))
+        self._finish(a, color, 1.5, subject, fill=color, opacity=0.25, measure=f"{kind}:{v:.10g}:{unit}")
         for c in cutouts:
-            ca = self.doc[pno].add_polygon_annot([tuple(p) for p in c])
+            ca = self._page(pno).add_polygon_annot(self._tus(pno, c))
             self._finish(ca, (0.5, 0.5, 0.5), 1, "Cutout", fill=(1, 1, 1), opacity=0.8)
             self.doc.xref_set_key(ca.xref, PARENT_KEY, str(a.xref))
         if label:
@@ -601,8 +674,8 @@ class Document(PageOps):
         r = fitz.Rect(rect).normalize()
         sc = self.scale_for(pno)
         v = math.pi * (r.width / 2) * (r.height / 2) * sc.unit_per_pt ** 2
-        a = self.doc[pno].add_circle_annot(r)
-        self._finish(a, color, 1.5, subject, fill=color, opacity=0.25, measure=f"area:{v:.6f}:{sc.unit}")
+        a = self._page(pno).add_circle_annot(self._ru(pno, r))
+        self._finish(a, color, 1.5, subject, fill=color, opacity=0.25, measure=f"area:{v:.10g}:{sc.unit}")
         if label:
             self._label(pno, self._centroid([tuple(r.tl), tuple(r.br)]), f"{v:.2f} {sc.unit}²", color, a)
         return a, v
@@ -614,8 +687,8 @@ class Document(PageOps):
         rad = math.dist(p1, p2) / 2
         sc = self.scale_for(pno)
         v = math.dist(p1, p2) * sc.unit_per_pt
-        a = self.doc[pno].add_circle_annot(fitz.Rect(c[0] - rad, c[1] - rad, c[0] + rad, c[1] + rad))
-        self._finish(a, color, 1.5, subject, measure=f"diameter:{v:.6f}:{sc.unit}")
+        a = self._page(pno).add_circle_annot(self._ru(pno, fitz.Rect(c[0] - rad, c[1] - rad, c[0] + rad, c[1] + rad)))
+        self._finish(a, color, 1.5, subject, measure=f"diameter:{v:.10g}:{sc.unit}")
         if label:
             self._label(pno, c, f"Ø {v:.2f} {sc.unit}", color, a)
         return a, v
@@ -623,8 +696,8 @@ class Document(PageOps):
     @_mutates
     def add_angle(self, pno, a_, b_, c_, color=(0, 0.4, 1), label=True, subject="Angle"):
         deg = angle_deg(a_, b_, c_)
-        a = self.doc[pno].add_polyline_annot([a_, b_, c_])
-        self._finish(a, color, 1.5, subject, measure=f"angle:{deg:.6f}:deg")
+        a = self._page(pno).add_polyline_annot(self._tus(pno, [a_, b_, c_]))
+        self._finish(a, color, 1.5, subject, measure=f"angle:{deg:.10g}:deg")
         if label:
             self._label(pno, b_, f"{deg:.1f}°", color, a)
         return a, deg
@@ -632,7 +705,7 @@ class Document(PageOps):
     @_mutates
     def add_count(self, pno, point, color=(0.8, 0, 0.8), group="Count"):
         r = fitz.Rect(point[0] - 5, point[1] - 5, point[0] + 5, point[1] + 5)
-        a = self.doc[pno].add_circle_annot(r)
+        a = self._page(pno).add_circle_annot(self._ru(pno, r))
         self._finish(a, color, 1.5, group, fill=color, measure="count:1:ea")
         return a
 
@@ -700,22 +773,27 @@ class Document(PageOps):
                 w.writerow([s, k, n, f"{t:.4f}", u])
 
     def render(self, pno, zoom=1.0, clip=None) -> fitz.Pixmap:
-        return self.doc[pno].get_pixmap(matrix=fitz.Matrix(zoom, zoom), annots=True, clip=clip)
+        return self._page(pno).get_pixmap(matrix=fitz.Matrix(zoom, zoom), annots=True, clip=clip)
 
     def save(self, path=None, **opts):
+        """Save (to `path`, or in place). A document opened with a password stays encrypted with it."""
         self._store_scales()
         path = path or self.path
         if path is None:
             raise ValueError("no path")
         kw = {"garbage": 3, "deflate": True, **opts}
+        if self._password and "encryption" not in kw:
+            kw.update(encryption=fitz.PDF_ENCRYPT_AES_256, user_pw=self._password, owner_pw=self._password + "-owner",
+                      permissions=-1)
         if path == self.path:
             tmp = path + ".tmp"
             self.doc.save(tmp, **kw)
+            self._invalidate_pages()
             self.doc.close()
             os.replace(tmp, path)
             self.doc = fitz.open(path)
-            if opts.get("encryption", None) is None and self.doc.needs_pass:
-                raise PermissionError("saved file is encrypted; reopen with password")
+            if self.doc.needs_pass and not self.doc.authenticate(self._password or kw.get("user_pw", "")):
+                raise PermissionError("saved file is encrypted; reopen with its password")
         else:
             self.doc.save(path, **kw)
             self.path = path
