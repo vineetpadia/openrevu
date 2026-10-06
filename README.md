@@ -355,6 +355,9 @@ OpenRevu has these limits:
 
 ## Contribute
 
+A person (or a computer-use agent) can test the window by hand with `docs/testing/MANUAL_TEST_PLAN.md`.
+The script `docs/testing/make_samples.py` makes the sample files that the plan uses.
+
 Run `pytest` before you send a change. Add a test for each fix or new function.
 To make the screenshots again, run `python docs/make_screenshots.py`.
 
